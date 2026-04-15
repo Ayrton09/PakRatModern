@@ -1,0 +1,10 @@
+﻿# Ignore generated artifacts and local-only files
+release/
+*.zip
+*.exe
+*.exe.config
+*.log
+*.lnk
+pakrat_modern_gui.settings.json
+__pycache__/
+*.pyc
