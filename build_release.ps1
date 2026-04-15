@@ -17,7 +17,6 @@ Copy-Item "$PSScriptRoot\pakrat_modern_gui.bat" $ReleaseRoot -Force
 Copy-Item "$PSScriptRoot\pakrat_modern_gui.ps1" $ReleaseRoot -Force
 Copy-Item "$PSScriptRoot\README.md" $ReleaseRoot -Force
 Copy-Item "$PSScriptRoot\pakrat_modern.ico" $ReleaseRoot -Force
-Copy-Item "$PSScriptRoot\pakrat_modern_icon.png" $ReleaseRoot -Force
 
 $shortcutPath = Join-Path $ReleaseRoot 'PakRat Modern.lnk'
 $wshell = New-Object -ComObject WScript.Shell
