@@ -2,8 +2,6 @@
 from PIL import Image, ImageDraw, ImageFilter
 
 ROOT = Path(__file__).resolve().parent
-ASSETS = ROOT / 'assets' / 'source_style_v13'
-ASSETS.mkdir(parents=True, exist_ok=True)
 PREVIEW = Path(r'C:\Users\Public\PakRatSourceStyleV13.png')
 
 OUT = 256
@@ -106,8 +104,8 @@ accent = accent.filter(ImageFilter.GaussianBlur(1.0))
 img.alpha_composite(accent)
 
 out = img.resize((OUT, OUT), Image.Resampling.LANCZOS)
-png = ASSETS / 'pakrat_source_style_v13.png'
-ico = ASSETS / 'pakrat_source_style_v13.ico'
+png = ROOT / 'pakrat_modern_icon.png'
+ico = ROOT / 'pakrat_modern.ico'
 out.save(png)
 out.save(ico, sizes=[(256, 256), (128, 128), (64, 64), (48, 48), (32, 32), (24, 24), (16, 16)])
 out.save(PREVIEW)

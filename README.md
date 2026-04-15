@@ -2,6 +2,8 @@
 
 Modern PakRat-style tool for editing the `PAKFILE` lump inside Source `.bsp` maps.
 
+![PakRat Modern screenshot](docs/pakrat-modern-screenshot.png)
+
 It includes:
 - Native Windows GUI
 - CLI for scripting and automation
@@ -14,13 +16,13 @@ Recommended launch options:
 1. Run the compiled app:
 
 ```text
-C:\Users\Ayrton\Documents\New project 7\PakRatModern.exe
+PakRatModern.exe
 ```
 
 2. Or run the PowerShell GUI script directly:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File "C:\Users\Ayrton\Documents\New project 7\pakrat_modern_gui.ps1"
+powershell -ExecutionPolicy Bypass -File .\pakrat_modern_gui.ps1
 ```
 
 Quick workflow:
@@ -62,10 +64,10 @@ Optional extras currently checked by scan:
 ## CLI
 
 Main CLI script:
-- [pakrat_modern.py](/C:/Users/Ayrton/Documents/New%20project%207/pakrat_modern.py)
+- [pakrat_modern.py](pakrat_modern.py)
 
 PowerShell wrapper:
-- [pakrat_modern.ps1](/C:/Users/Ayrton/Documents/New%20project%207/pakrat_modern.ps1)
+- [pakrat_modern.ps1](pakrat_modern.ps1)
 
 Examples:
 
@@ -80,8 +82,8 @@ powershell -ExecutionPolicy Bypass -File .\pakrat_modern.ps1 remove C:\path\map.
 ## Build the EXE
 
 Build script:
-- [build_pakrat_modern_gui.ps1](/C:/Users/Ayrton/Documents/New%20project%207/build_pakrat_modern_gui.ps1)
-- [build_release.ps1](/C:/Users/Ayrton/Documents/New%20project%207/build_release.ps1)
+- [build_pakrat_modern_gui.ps1](build_pakrat_modern_gui.ps1)
+- [build_release.ps1](build_release.ps1)
 
 Manual build:
 

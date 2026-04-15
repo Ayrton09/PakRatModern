@@ -1,7 +1,7 @@
 ﻿param(
     [string]$InputFile = "$PSScriptRoot\\pakrat_modern_gui.ps1",
     [string]$OutputFile = "$PSScriptRoot\\PakRatModern.exe",
-    [string]$IconFile = "$PSScriptRoot\\assets\\pakrat_modern.ico",
+    [string]$IconFile = "$PSScriptRoot\\pakrat_modern.ico",
     [string]$Version = '1.0.0.0'
 )
 
