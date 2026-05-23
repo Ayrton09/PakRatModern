@@ -33,7 +33,7 @@ function Get-AppBasePath {
 
 $script:AppBasePath = Get-AppBasePath
 $script:StartupLogPath = Join-Path $script:AppBasePath 'PakRatModern-startup.log'
-$script:AppVersion = '1.1.0'
+$script:AppVersion = '1.2.0'
 
 function Write-StartupLog {
     param(
@@ -161,6 +161,463 @@ public static class PakRatDwm
 {
     [DllImport("dwmapi.dll")]
     public static extern int DwmSetWindowAttribute(IntPtr hwnd, int attr, ref int attrValue, int attrSize);
+}
+"@
+}
+
+if (-not ('PakRatNativeTheme' -as [type])) {
+    Add-Type -ReferencedAssemblies @('System.dll') -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+
+public static class PakRatNativeTheme
+{
+    [DllImport("uxtheme.dll", CharSet = CharSet.Unicode)]
+    public static extern int SetWindowTheme(IntPtr hwnd, string subAppName, string subIdList);
+
+    [DllImport("uxtheme.dll", EntryPoint = "#135")]
+    public static extern int SetPreferredAppMode(int appMode);
+
+    [DllImport("uxtheme.dll", EntryPoint = "#136")]
+    public static extern void FlushMenuThemes();
+}
+"@
+}
+
+if (-not ('PakRatListViewNative' -as [type])) {
+    Add-Type -ReferencedAssemblies @('System.dll') -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+
+public static class PakRatListViewNative
+{
+    private const int SB_VERT = 1;
+
+    [DllImport("user32.dll")]
+    private static extern bool ShowScrollBar(IntPtr hWnd, int wBar, bool bShow);
+
+    public static void HideVerticalScrollBar(IntPtr handle)
+    {
+        if (handle != IntPtr.Zero)
+        {
+            ShowScrollBar(handle, SB_VERT, false);
+        }
+    }
+}
+"@
+}
+
+if (-not ('PakRatWheelPanel' -as [type])) {
+    Add-Type -ReferencedAssemblies @('System.dll', 'System.Windows.Forms.dll') -TypeDefinition @"
+using System;
+using System.Windows.Forms;
+
+public class PakRatWheelPanel : Panel
+{
+    public PakRatWheelPanel()
+    {
+        SetStyle(ControlStyles.Selectable, true);
+        TabStop = true;
+    }
+
+    public void ActivateForWheel()
+    {
+        Control parent = Parent;
+        while (parent != null)
+        {
+            ContainerControl container = parent as ContainerControl;
+            if (container != null)
+            {
+                container.ActiveControl = this;
+                break;
+            }
+            parent = parent.Parent;
+        }
+
+        Select();
+        Focus();
+    }
+
+    protected override void OnMouseEnter(EventArgs e)
+    {
+        base.OnMouseEnter(e);
+        ActivateForWheel();
+    }
+
+    protected override void OnMouseMove(MouseEventArgs e)
+    {
+        base.OnMouseMove(e);
+        if (!Focused)
+        {
+            ActivateForWheel();
+        }
+    }
+}
+"@
+}
+
+if (-not ('PakRatMouseWheelForwarder' -as [type])) {
+    Add-Type -ReferencedAssemblies @('System.dll', 'System.Windows.Forms.dll') -TypeDefinition @"
+using System;
+using System.Collections.Generic;
+using System.Runtime.InteropServices;
+using System.Windows.Forms;
+
+public sealed class PakRatMouseWheelForwarder : IMessageFilter
+{
+    private const int WM_MOUSEWHEEL = 0x020A;
+    private const int WH_MOUSE_LL = 14;
+    private static readonly Dictionary<IntPtr, IntPtr> TargetByHandle = new Dictionary<IntPtr, IntPtr>();
+    private static readonly object Sync = new object();
+    private static bool installed;
+    private static IntPtr hookHandle = IntPtr.Zero;
+    private static readonly LowLevelMouseProc mouseProc = HookCallback;
+
+    private delegate IntPtr LowLevelMouseProc(int nCode, IntPtr wParam, IntPtr lParam);
+
+    public static void Register(Control control)
+    {
+        Register(control, control);
+    }
+
+    public static void Register(Control control, Control wheelTarget)
+    {
+        if (control == null)
+        {
+            return;
+        }
+
+        if (wheelTarget == null)
+        {
+            wheelTarget = control;
+        }
+
+        EnsureInstalled();
+        if (control.IsHandleCreated)
+        {
+            AddHandle(control.Handle, wheelTarget.IsHandleCreated ? wheelTarget.Handle : control.Handle);
+        }
+
+        control.HandleCreated += delegate { AddHandle(control.Handle, wheelTarget.IsHandleCreated ? wheelTarget.Handle : control.Handle); };
+        control.HandleDestroyed += delegate { RemoveHandle(control.Handle); };
+        wheelTarget.HandleCreated += delegate
+        {
+            if (control.IsHandleCreated)
+            {
+                AddHandle(control.Handle, wheelTarget.Handle);
+            }
+        };
+    }
+
+    private static void EnsureInstalled()
+    {
+        if (installed)
+        {
+            return;
+        }
+
+        Application.AddMessageFilter(new PakRatMouseWheelForwarder());
+        InstallHook();
+        installed = true;
+    }
+
+    private static void InstallHook()
+    {
+        if (hookHandle != IntPtr.Zero)
+        {
+            return;
+        }
+
+        hookHandle = SetWindowsHookEx(WH_MOUSE_LL, mouseProc, GetModuleHandle(null), 0);
+        Application.ApplicationExit += delegate
+        {
+            if (hookHandle != IntPtr.Zero)
+            {
+                UnhookWindowsHookEx(hookHandle);
+                hookHandle = IntPtr.Zero;
+            }
+        };
+    }
+
+    private static void AddHandle(IntPtr handle, IntPtr targetHandle)
+    {
+        if (handle == IntPtr.Zero)
+        {
+            return;
+        }
+
+        lock (Sync)
+        {
+            TargetByHandle[handle] = (targetHandle == IntPtr.Zero) ? handle : targetHandle;
+        }
+    }
+
+    private static void RemoveHandle(IntPtr handle)
+    {
+        if (handle == IntPtr.Zero)
+        {
+            return;
+        }
+
+        lock (Sync)
+        {
+            TargetByHandle.Remove(handle);
+        }
+    }
+
+    public bool PreFilterMessage(ref Message m)
+    {
+        if (m.Msg != WM_MOUSEWHEEL)
+        {
+            return false;
+        }
+
+        POINT point;
+        if (!GetCursorPos(out point))
+        {
+            return false;
+        }
+
+        IntPtr target = WindowFromPoint(point);
+        if (target == IntPtr.Zero)
+        {
+            return false;
+        }
+
+        lock (Sync)
+        {
+            foreach (KeyValuePair<IntPtr, IntPtr> pair in TargetByHandle)
+            {
+                IntPtr handle = pair.Key;
+                if (target == handle || IsChild(handle, target))
+                {
+                    SendMessage(pair.Value, m.Msg, m.WParam, m.LParam);
+                    return true;
+                }
+            }
+        }
+
+        return false;
+    }
+
+    private static IntPtr HookCallback(int nCode, IntPtr wParam, IntPtr lParam)
+    {
+        if (nCode >= 0 && wParam.ToInt32() == WM_MOUSEWHEEL)
+        {
+            MSLLHOOKSTRUCT data = (MSLLHOOKSTRUCT)Marshal.PtrToStructure(lParam, typeof(MSLLHOOKSTRUCT));
+            IntPtr target = WindowFromPoint(data.pt);
+            if (target != IntPtr.Zero)
+            {
+                lock (Sync)
+                {
+                    foreach (KeyValuePair<IntPtr, IntPtr> pair in TargetByHandle)
+                    {
+                        IntPtr handle = pair.Key;
+                        if (target == handle || IsChild(handle, target))
+                        {
+                            int lParamValue = ((data.pt.Y & 0xffff) << 16) | (data.pt.X & 0xffff);
+                            IntPtr wheelWParam = new IntPtr(unchecked((int)(data.mouseData & 0xffff0000)));
+                            PostMessage(pair.Value, WM_MOUSEWHEEL, wheelWParam, new IntPtr(lParamValue));
+                            return new IntPtr(1);
+                        }
+                    }
+                }
+            }
+        }
+
+        return CallNextHookEx(hookHandle, nCode, wParam, lParam);
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct POINT
+    {
+        public int X;
+        public int Y;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct MSLLHOOKSTRUCT
+    {
+        public POINT pt;
+        public uint mouseData;
+        public uint flags;
+        public uint time;
+        public IntPtr dwExtraInfo;
+    }
+
+    [DllImport("user32.dll")]
+    private static extern bool GetCursorPos(out POINT lpPoint);
+
+    [DllImport("user32.dll")]
+    private static extern IntPtr WindowFromPoint(POINT point);
+
+    [DllImport("user32.dll")]
+    private static extern bool IsChild(IntPtr hWndParent, IntPtr hWnd);
+
+    [DllImport("user32.dll")]
+    private static extern IntPtr SendMessage(IntPtr hWnd, int msg, IntPtr wParam, IntPtr lParam);
+
+    [DllImport("user32.dll")]
+    private static extern bool PostMessage(IntPtr hWnd, int msg, IntPtr wParam, IntPtr lParam);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern IntPtr SetWindowsHookEx(int idHook, LowLevelMouseProc lpfn, IntPtr hMod, uint dwThreadId);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern bool UnhookWindowsHookEx(IntPtr hhk);
+
+    [DllImport("user32.dll")]
+    private static extern IntPtr CallNextHookEx(IntPtr hhk, int nCode, IntPtr wParam, IntPtr lParam);
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Auto, SetLastError = true)]
+    private static extern IntPtr GetModuleHandle(string lpModuleName);
+}
+"@
+}
+
+if (-not ('PakRatFolderPicker' -as [type])) {
+    Add-Type -ReferencedAssemblies @('System.dll') -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+
+public static class PakRatFolderPicker
+{
+    private const uint FOS_PICKFOLDERS = 0x00000020;
+    private const uint FOS_FORCEFILESYSTEM = 0x00000040;
+    private const uint FOS_NOCHANGEDIR = 0x00000008;
+    private const uint FOS_PATHMUSTEXIST = 0x00000800;
+    private const uint SIGDN_FILESYSPATH = 0x80058000;
+    private static readonly Guid ShellItemGuid = new Guid("43826D1E-E718-42EE-BC55-A1E261C37BFE");
+
+    public static string PickFolder(string title, string initialDirectory, IntPtr owner)
+    {
+        IFileOpenDialog dialog = (IFileOpenDialog)new FileOpenDialogRCW();
+        try
+        {
+            uint options;
+            dialog.GetOptions(out options);
+            dialog.SetOptions(options | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST | FOS_NOCHANGEDIR);
+
+            if (!String.IsNullOrWhiteSpace(title))
+            {
+                dialog.SetTitle(title);
+            }
+            dialog.SetOkButtonLabel("Select Folder");
+
+            if (!String.IsNullOrWhiteSpace(initialDirectory) && System.IO.Directory.Exists(initialDirectory))
+            {
+                IShellItem folder;
+                Guid iid = ShellItemGuid;
+                int hr = SHCreateItemFromParsingName(initialDirectory, IntPtr.Zero, ref iid, out folder);
+                if (hr == 0 && folder != null)
+                {
+                    dialog.SetFolder(folder);
+                }
+            }
+
+            int result = dialog.Show(owner);
+            if (result != 0)
+            {
+                return null;
+            }
+
+            IShellItem item;
+            dialog.GetResult(out item);
+            if (item == null)
+            {
+                return null;
+            }
+
+            IntPtr pathPtr;
+            item.GetDisplayName(SIGDN_FILESYSPATH, out pathPtr);
+            if (pathPtr == IntPtr.Zero)
+            {
+                return null;
+            }
+
+            try
+            {
+                return Marshal.PtrToStringUni(pathPtr);
+            }
+            finally
+            {
+                Marshal.FreeCoTaskMem(pathPtr);
+            }
+        }
+        finally
+        {
+            if (dialog != null)
+            {
+                Marshal.ReleaseComObject(dialog);
+            }
+        }
+    }
+
+    [DllImport("shell32.dll", CharSet = CharSet.Unicode, PreserveSig = true)]
+    private static extern int SHCreateItemFromParsingName(
+        [MarshalAs(UnmanagedType.LPWStr)] string pszPath,
+        IntPtr pbc,
+        ref Guid riid,
+        out IShellItem ppv);
+
+    [ComImport]
+    [Guid("DC1C5A9C-E88A-4DDE-A5A1-60F82A20AEF7")]
+    private class FileOpenDialogRCW
+    {
+    }
+
+    [ComImport]
+    [Guid("42F85136-DB7E-439C-85F1-E4075D135FC8")]
+    [InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    private interface IFileDialog
+    {
+        [PreserveSig]
+        int Show(IntPtr parent);
+        void SetFileTypes(uint cFileTypes, IntPtr rgFilterSpec);
+        void SetFileTypeIndex(uint iFileType);
+        void GetFileTypeIndex(out uint piFileType);
+        void Advise(IntPtr pfde, out uint pdwCookie);
+        void Unadvise(uint dwCookie);
+        void SetOptions(uint fos);
+        void GetOptions(out uint pfos);
+        void SetDefaultFolder(IShellItem psi);
+        void SetFolder(IShellItem psi);
+        void GetFolder(out IShellItem ppsi);
+        void GetCurrentSelection(out IShellItem ppsi);
+        void SetFileName([MarshalAs(UnmanagedType.LPWStr)] string pszName);
+        void GetFileName([MarshalAs(UnmanagedType.LPWStr)] out string pszName);
+        void SetTitle([MarshalAs(UnmanagedType.LPWStr)] string pszTitle);
+        void SetOkButtonLabel([MarshalAs(UnmanagedType.LPWStr)] string pszText);
+        void SetFileNameLabel([MarshalAs(UnmanagedType.LPWStr)] string pszLabel);
+        void GetResult(out IShellItem ppsi);
+        void AddPlace(IShellItem psi, int fdap);
+        void SetDefaultExtension([MarshalAs(UnmanagedType.LPWStr)] string pszDefaultExtension);
+        void Close(int hr);
+        void SetClientGuid(ref Guid guid);
+        void ClearClientData();
+        void SetFilter(IntPtr pFilter);
+    }
+
+    [ComImport]
+    [Guid("D57C7288-D4AD-4768-BE02-9D969532D960")]
+    [InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    private interface IFileOpenDialog : IFileDialog
+    {
+        void GetResults(out IntPtr ppenum);
+        void GetSelectedItems(out IntPtr ppsai);
+    }
+
+    [ComImport]
+    [Guid("43826D1E-E718-42EE-BC55-A1E261C37BFE")]
+    [InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    private interface IShellItem
+    {
+        void BindToHandler(IntPtr pbc, ref Guid bhid, ref Guid riid, out IntPtr ppv);
+        void GetParent(out IShellItem ppsi);
+        void GetDisplayName(uint sigdnName, out IntPtr ppszName);
+        void GetAttributes(uint sfgaoMask, out uint psfgaoAttribs);
+        void Compare(IShellItem psi, uint hint, out int piOrder);
+    }
 }
 "@
 }
@@ -423,6 +880,7 @@ $GameLumpIndex = 35
 $EntitiesLumpIndex = 0
 $TexDataStringDataLumpIndex = 43
 $TexDataStringTableLumpIndex = 44
+$StaticPropGameLumpId = 1936749168
 $HeaderSize = 4 + 4 + ($LumpCount * 16) + 4
 $MaxBspBytes = [int64](1024MB)
 $MaxPakEntryBytes = [int64](512MB)
@@ -440,8 +898,15 @@ $script:ScanSummaryCanAddLabel = $null
 $script:ScanSummaryNotFoundLabel = $null
 $script:ScanSummaryInPakLabel = $null
 $script:ListView = $null
+$script:ListBodyPanel = $null
+$script:ListRowsPanel = $null
 $script:ListHeaderPanel = $null
 $script:ListHeaderButtons = @()
+$script:ListScrollBar = $null
+$script:ListScrollTrack = $null
+$script:ListScrollThumb = $null
+$script:ListScrollDragging = $false
+$script:ListScrollDragOffsetY = 0
 $script:TreeView = $null
 $script:DarkMenuRenderer = $null
 $script:Theme = [ordered]@{
@@ -459,6 +924,8 @@ $script:Theme = [ordered]@{
     RowAlt = [System.Drawing.Color]::FromArgb(36, 38, 43)
     Selection = [System.Drawing.Color]::FromArgb(64, 96, 150)
     Header = [System.Drawing.Color]::FromArgb(45, 48, 54)
+    ScrollTrack = [System.Drawing.Color]::FromArgb(36, 39, 44)
+    ScrollThumb = [System.Drawing.Color]::FromArgb(96, 104, 116)
 }
 
 $script:State = [ordered]@{
@@ -475,7 +942,7 @@ $script:State = [ordered]@{
     IncludeExtrasInScan = $true
     BackupBeforeInPlaceSave = $true
     ViewAsTree = $false
-    SortColumn = 2
+    SortColumn = 1
     SortDescending = $false
     ScanMissingTotal = 0
     ScanCanAdd = 0
@@ -723,6 +1190,7 @@ function Apply-DarkThemeRecursive {
         $Control.BackColor = $script:Theme.Input
         $Control.ForeColor = $script:Theme.Text
         $Control.BorderStyle = 'None'
+        Enable-NativeDarkControlTheme -Control $Control
     }
     elseif ($Control -is [System.Windows.Forms.ComboBox]) {
         $Control.BackColor = $script:Theme.Input
@@ -735,18 +1203,21 @@ function Apply-DarkThemeRecursive {
         $Control.ForeColor = $script:Theme.Text
         $Control.BorderStyle = 'FixedSingle'
         Enable-DarkListBoxRendering -ListBox $Control
+        Enable-NativeDarkControlTheme -Control $Control
     }
     elseif ($Control -is [System.Windows.Forms.ListView]) {
         Set-ControlDoubleBuffered -Control $Control
         $Control.BackColor = $script:Theme.Input
         $Control.ForeColor = $script:Theme.Text
         $Control.BorderStyle = 'None'
+        Enable-NativeDarkControlTheme -Control $Control
     }
     elseif ($Control -is [System.Windows.Forms.TreeView]) {
         Set-ControlDoubleBuffered -Control $Control
         $Control.BackColor = $script:Theme.Input
         $Control.ForeColor = $script:Theme.Text
         $Control.BorderStyle = 'None'
+        Enable-NativeDarkControlTheme -Control $Control
     }
     elseif ($Control -is [System.Windows.Forms.Button]) {
         $Control.UseVisualStyleBackColor = $false
@@ -844,6 +1315,13 @@ function Apply-DarkThemeToContextMenu {
     }
 }
 
+function Enable-NativeDarkAppMode {
+    try {
+        [void][PakRatNativeTheme]::SetPreferredAppMode(2)
+        [PakRatNativeTheme]::FlushMenuThemes()
+    } catch { }
+}
+
 function Enable-DarkTitleBar {
     param([System.Windows.Forms.Form]$Form)
     if ($null -eq $Form) { return }
@@ -853,6 +1331,35 @@ function Enable-DarkTitleBar {
         foreach ($attribute in @(20, 19)) {
             [void][PakRatDwm]::DwmSetWindowAttribute($Form.Handle, $attribute, [ref]$enabled, 4)
         }
+    } catch { }
+}
+
+function Enable-NativeDarkControlTheme {
+    param([System.Windows.Forms.Control]$Control)
+    if ($null -eq $Control) { return }
+
+    $apply = {
+        param($target)
+        try {
+            if ($target -and $target.Handle -ne [IntPtr]::Zero) {
+                [void][PakRatNativeTheme]::SetWindowTheme($target.Handle, 'DarkMode_Explorer', $null)
+            }
+        } catch { }
+    }
+
+    & $apply $Control
+    $Control.Add_HandleCreated({
+        try {
+            [void][PakRatNativeTheme]::SetWindowTheme($this.Handle, 'DarkMode_Explorer', $null)
+        } catch { }
+    })
+}
+
+function Hide-NativeListViewScrollBars {
+    param([System.Windows.Forms.ListView]$ListView)
+    if ($null -eq $ListView -or -not $ListView.IsHandleCreated) { return }
+    try {
+        [PakRatListViewNative]::HideVerticalScrollBar($ListView.Handle)
     } catch { }
 }
 
@@ -877,6 +1384,7 @@ function Enable-DarkListViewRendering {
     $ListView.HideSelection = $false
     $ListView.BackColor = $script:Theme.Input
     $ListView.ForeColor = $script:Theme.Text
+    Enable-NativeDarkControlTheme -Control $ListView
 
     if (-not $UseOwnerDraw) {
         $ListView.OwnerDraw = $false
@@ -910,11 +1418,39 @@ function Enable-DarkListViewRendering {
     $ListView.Add_DrawItem({
         if ($ListView.View -ne [System.Windows.Forms.View]::Details) {
             $_.DrawDefault = $true
+            return
+        }
+
+        $isSelected = $_.Item.Selected
+        $rowColor = if ($isSelected) { $script:Theme.Selection } elseif (($_.ItemIndex % 2) -eq 0) { $script:Theme.Input } else { $script:Theme.RowAlt }
+        $fgColor = if ($isSelected) { $script:Theme.AccentText } else { $_.Item.ForeColor }
+        if ($fgColor -eq [System.Drawing.Color]::Empty) { $fgColor = $script:Theme.Text }
+
+        $firstColumnWidth = if ($ListView.Columns.Count -gt 0) { $ListView.Columns[0].Width } else { $_.Bounds.Width }
+        $cellBounds = New-Object System.Drawing.Rectangle($_.Bounds.Left, $_.Bounds.Top, [Math]::Min($_.Bounds.Width, $firstColumnWidth), $_.Bounds.Height)
+        $bg = New-Object System.Drawing.SolidBrush($rowColor)
+        $pen = New-Object System.Drawing.Pen($script:Theme.Border)
+        try {
+            $_.Graphics.FillRectangle($bg, $cellBounds)
+            $textRect = New-Object System.Drawing.Rectangle($cellBounds.Left + 4, $cellBounds.Top, [Math]::Max(0, $cellBounds.Width - 6), $cellBounds.Height)
+            [System.Windows.Forms.TextRenderer]::DrawText(
+                $_.Graphics,
+                $_.Item.Text,
+                $_.Item.Font,
+                $textRect,
+                $fgColor,
+                [System.Windows.Forms.TextFormatFlags]::Left -bor [System.Windows.Forms.TextFormatFlags]::VerticalCenter -bor [System.Windows.Forms.TextFormatFlags]::EndEllipsis
+            )
+            $_.Graphics.DrawLine($pen, $cellBounds.Left, $cellBounds.Bottom - 1, $cellBounds.Right, $cellBounds.Bottom - 1)
+            $_.Graphics.DrawLine($pen, $cellBounds.Right - 1, $cellBounds.Top, $cellBounds.Right - 1, $cellBounds.Bottom)
+        } finally {
+            $bg.Dispose()
+            $pen.Dispose()
         }
     })
 
     $ListView.Add_DrawSubItem({
-        $isSelected = ($_.ItemState -band [System.Windows.Forms.ListViewItemStates]::Selected) -ne 0
+        $isSelected = $_.Item.Selected
         $rowColor = if ($isSelected) { $script:Theme.Selection } elseif (($_.ItemIndex % 2) -eq 0) { $script:Theme.Input } else { $script:Theme.RowAlt }
         $fgColor = if ($isSelected) { $script:Theme.AccentText } else { $_.Item.ForeColor }
         if ($fgColor -eq [System.Drawing.Color]::Empty) { $fgColor = $script:Theme.Text }
@@ -943,6 +1479,148 @@ function Enable-DarkListViewRendering {
             $pen.Dispose()
         }
     })
+}
+
+function Get-ListViewRowHeight {
+    if ($null -eq $script:ListView -or $script:ListView.Items.Count -eq 0) { return 18 }
+    try {
+        $rect = $script:ListView.GetItemRect(0)
+        if ($rect.Height -gt 0) { return $rect.Height }
+    } catch { }
+    return 18
+}
+
+function Get-ListViewVisibleRowCount {
+    if ($null -eq $script:ListView) { return 1 }
+    $rowHeight = Get-ListViewRowHeight
+    return [Math]::Max(1, [int][Math]::Floor($script:ListView.ClientSize.Height / [double]$rowHeight))
+}
+
+function Get-ListViewTopIndex {
+    if ($null -eq $script:ListView -or $script:ListView.Items.Count -eq 0) { return 0 }
+    try {
+        if ($script:ListView.TopItem) { return [int]$script:ListView.TopItem.Index }
+    } catch { }
+    return 0
+}
+
+function Scroll-ListViewToTopIndex {
+    param([int]$Index)
+    if ($null -eq $script:ListView -or $script:ListView.Items.Count -eq 0) { return }
+
+    $visibleRows = Get-ListViewVisibleRowCount
+    $maxTop = [Math]::Max(0, $script:ListView.Items.Count - $visibleRows)
+    $target = [Math]::Max(0, [Math]::Min($Index, $maxTop))
+    try {
+        $script:ListView.TopItem = $script:ListView.Items[$target]
+    } catch {
+        try { $script:ListView.EnsureVisible($target) } catch { }
+    }
+    Hide-NativeListViewScrollBars -ListView $script:ListView
+    Update-ListScrollBar
+}
+
+function Update-ListScrollBar {
+    if ($null -eq $script:ListView -or $null -eq $script:ListScrollBar -or $null -eq $script:ListScrollTrack -or $null -eq $script:ListScrollThumb) { return }
+
+    $script:ListScrollBar.BackColor = $script:Theme.Panel
+    $script:ListScrollTrack.BackColor = $script:Theme.ScrollTrack
+    $script:ListScrollThumb.BackColor = $script:Theme.ScrollThumb
+
+    $total = [int]$script:ListView.Items.Count
+    $visibleRows = Get-ListViewVisibleRowCount
+    $needsScroll = ($total -gt $visibleRows)
+    $script:ListScrollBar.Visible = $needsScroll
+    if (-not $needsScroll) { return }
+
+    $trackHeight = [Math]::Max(1, $script:ListScrollTrack.ClientSize.Height)
+    $thumbHeight = [Math]::Max(44, [int][Math]::Floor($trackHeight * ($visibleRows / [double]$total)))
+    $thumbHeight = [Math]::Min($trackHeight, $thumbHeight)
+    $range = [Math]::Max(0, $trackHeight - $thumbHeight)
+    $maxTop = [Math]::Max(1, $total - $visibleRows)
+    $topIndex = [Math]::Max(0, [Math]::Min((Get-ListViewTopIndex), $maxTop))
+    $thumbTop = if ($range -gt 0) { [int][Math]::Round($range * ($topIndex / [double]$maxTop)) } else { 0 }
+
+    $script:ListScrollThumb.Left = 3
+    $script:ListScrollThumb.Width = [Math]::Max(10, $script:ListScrollTrack.ClientSize.Width - 6)
+    $script:ListScrollThumb.Height = $thumbHeight
+    $script:ListScrollThumb.Top = $thumbTop
+}
+
+function Scroll-ListViewFromThumbY {
+    param([int]$ThumbY)
+    if ($null -eq $script:ListView -or $null -eq $script:ListScrollTrack -or $null -eq $script:ListScrollThumb) { return }
+    if ($script:ListView.Items.Count -eq 0) { return }
+
+    $visibleRows = Get-ListViewVisibleRowCount
+    $maxTop = [Math]::Max(0, $script:ListView.Items.Count - $visibleRows)
+    $range = [Math]::Max(1, $script:ListScrollTrack.ClientSize.Height - $script:ListScrollThumb.Height)
+    $clampedY = [Math]::Max(0, [Math]::Min($ThumbY, $range))
+    $target = [int][Math]::Round($maxTop * ($clampedY / [double]$range))
+    Scroll-ListViewToTopIndex -Index $target
+}
+
+function Scroll-ListViewByRows {
+    param([int]$Rows)
+    Scroll-ListViewToTopIndex -Index ((Get-ListViewTopIndex) + $Rows)
+}
+
+function Get-MouseWheelScrollRows {
+    param(
+        [int]$Delta,
+        [int]$VisibleRows
+    )
+
+    if ($Delta -eq 0) { return 0 }
+
+    $lines = [System.Windows.Forms.SystemInformation]::MouseWheelScrollLines
+    if ($lines -le 0) {
+        $lines = 3
+    } elseif ($lines -gt 100) {
+        $lines = [Math]::Max(1, $VisibleRows)
+    }
+
+    $notches = [Math]::Max(1, [int][Math]::Ceiling([Math]::Abs($Delta) / 120.0))
+    $rows = [int]($lines * $notches)
+    if ($Delta -gt 0) { return -$rows }
+    return $rows
+}
+
+function Scroll-ListViewByWheelDelta {
+    param([int]$Delta)
+
+    $rows = Get-MouseWheelScrollRows -Delta $Delta -VisibleRows (Get-ListViewVisibleRowCount)
+    if ($rows -eq 0) {
+        Update-ListScrollBar
+        return
+    }
+
+    Scroll-ListViewByRows -Rows $rows
+}
+
+function Set-WheelFocus {
+    param([System.Windows.Forms.Control]$Control)
+
+    if ($null -eq $Control) { return }
+    try {
+        $method = $Control.GetType().GetMethod('ActivateForWheel')
+        if ($method) {
+            [void]$method.Invoke($Control, @())
+            return
+        }
+    } catch { }
+
+    try { [void]$Control.Focus() } catch { }
+}
+
+function Set-MouseWheelHandled {
+    param($EventArgs)
+
+    try {
+        if ($EventArgs -is [System.Windows.Forms.HandledMouseEventArgs]) {
+            $EventArgs.Handled = $true
+        }
+    } catch { }
 }
 
 function Normalize-FolderPath {
@@ -1069,10 +1747,10 @@ function Align-4 {
 
 function Copy-ByteRange {
     param([byte[]]$Source, [int]$Start, [int]$Length)
-    if ($Length -le 0) { return [byte[]]@() }
+    if ($Length -le 0) { return ,[byte[]]@() }
     $dest = New-Object byte[] $Length
     [Array]::Copy($Source, $Start, $dest, 0, $Length)
-    return $dest
+    return ,$dest
 }
 
 function Assert-FileSizeLimit {
@@ -1089,10 +1767,85 @@ function Assert-FileSizeLimit {
     return [int64]$info.Length
 }
 
+function Read-FileBytesResponsive {
+    param(
+        [string]$Path,
+        [int64]$MaxBytes,
+        [string]$Label
+    )
+
+    $length = Assert-FileSizeLimit -Path $Path -MaxBytes $MaxBytes -Label $Label
+    $buffer = New-Object byte[] $length
+    if ($length -eq 0) { return ,$buffer }
+
+    $fs = [System.IO.File]::Open($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::Read)
+    try {
+        $offset = 0
+        $chunkSize = 1048576
+        while ($offset -lt $length) {
+            $toRead = [Math]::Min($chunkSize, $length - $offset)
+            $read = $fs.Read($buffer, $offset, $toRead)
+            if ($read -le 0) { throw "Could not read full file: $Path" }
+            $offset += $read
+            Pump-UiMessages
+        }
+    } finally {
+        $fs.Dispose()
+    }
+
+    return ,$buffer
+}
+
+function Copy-StreamToMemoryResponsive {
+    param(
+        [System.IO.Stream]$InputStream,
+        [System.IO.MemoryStream]$OutputStream
+    )
+
+    $buffer = New-Object byte[] 1048576
+    while ($true) {
+        $read = $InputStream.Read($buffer, 0, $buffer.Length)
+        if ($read -le 0) { break }
+        $OutputStream.Write($buffer, 0, $read)
+        Pump-UiMessages
+    }
+}
+
+function Write-BytesToStreamResponsive {
+    param(
+        [System.IO.Stream]$OutputStream,
+        [byte[]]$Bytes
+    )
+
+    if ($null -eq $Bytes -or $Bytes.Length -eq 0) { return }
+    $offset = 0
+    $chunkSize = 1048576
+    while ($offset -lt $Bytes.Length) {
+        $count = [Math]::Min($chunkSize, $Bytes.Length - $offset)
+        $OutputStream.Write($Bytes, $offset, $count)
+        $offset += $count
+        Pump-UiMessages
+    }
+}
+
+function Write-FileBytesResponsive {
+    param(
+        [string]$Path,
+        [byte[]]$Bytes
+    )
+
+    $fs = [System.IO.File]::Open($Path, [System.IO.FileMode]::Create, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+    try {
+        Write-BytesToStreamResponsive -OutputStream $fs -Bytes $Bytes
+    } finally {
+        $fs.Dispose()
+    }
+}
+
 function Normalize-ArchivePath {
     param([string]$PathValue)
     if ([string]::IsNullOrWhiteSpace($PathValue)) { throw 'Invalid internal path.' }
-    $p = $PathValue.Replace('\\', '/').Trim()
+    $p = $PathValue.Replace('\', '/').Trim()
     if ($p.StartsWith('/')) { throw "Unsafe absolute internal path: $PathValue" }
     if ([string]::IsNullOrWhiteSpace($p) -or $p -eq '.') { throw 'Invalid internal path.' }
     if ($p -match '[\x00-\x1F<>:"|?*]') { throw "Unsafe internal path characters: $PathValue" }
@@ -1310,7 +2063,7 @@ function Resolve-GameInfoSearchPath {
     param([string]$GameRoot, [string]$SearchPath)
 
     if ([string]::IsNullOrWhiteSpace($SearchPath)) { return $null }
-    $value = $SearchPath.Trim().Trim('"').Replace('\\', '/')
+    $value = $SearchPath.Trim().Trim('"').Replace('\', '/')
     if ([string]::IsNullOrWhiteSpace($value) -or $value.Contains('*')) { return $null }
     if ($value -eq 'GAME') { return $GameRoot }
 
@@ -1347,14 +2100,14 @@ function Get-BaseVpkEntries {
 
     $norm = Normalize-FolderPath -PathValue $GameRoot
     $entries = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
-    if ($null -eq $norm) { return $entries }
+    if ($null -eq $norm) { return ,$entries }
     $neededKey = Get-ArchivePathSetKey -Set $NeededRefs
     $neededArray = if ($null -ne $NeededRefs) { [string[]]@($NeededRefs | ForEach-Object { [string]$_ }) } else { $null }
 
     if (($null -ne $script:BaseVpkCache.Matches) -and
         $script:BaseVpkCache.GameRoot.Equals($norm, [System.StringComparison]::OrdinalIgnoreCase) -and
         $script:BaseVpkCache.NeededKey.Equals($neededKey, [System.StringComparison]::Ordinal)) {
-        return $script:BaseVpkCache.Matches
+        return ,$script:BaseVpkCache.Matches
     }
 
     $vpkFiles = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
@@ -1378,7 +2131,7 @@ function Get-BaseVpkEntries {
     $script:BaseVpkCache.GameRoot = $norm
     $script:BaseVpkCache.NeededKey = $neededKey
     $script:BaseVpkCache.Matches = $entries
-    return $entries
+    return ,$entries
 }
 
 function Test-BaseGameArchivePath {
@@ -1423,22 +2176,81 @@ function Get-EntryType {
     }
 }
 
+function Get-ArchiveSortBaseName {
+    param([string]$Name)
+
+    if ([string]::IsNullOrWhiteSpace($Name)) { return '' }
+    $leaf = [System.IO.Path]::GetFileName($Name.Replace('\', '/'))
+    if ($leaf -match '^(?i)(.+)\.(dx80|dx90|sw)\.vtx$') { return $Matches[1].ToLowerInvariant() }
+    return [System.IO.Path]::GetFileNameWithoutExtension($leaf).ToLowerInvariant()
+}
+
+function Get-ArchiveSortExtensionRank {
+    param([string]$Name)
+
+    if ([string]::IsNullOrWhiteSpace($Name)) { return 99 }
+    $leaf = [System.IO.Path]::GetFileName($Name.Replace('\', '/'))
+    $ext = [System.IO.Path]::GetExtension($leaf).ToLowerInvariant()
+
+    if ($leaf -match '^(?i).+\.dx80\.vtx$') { return 22 }
+    if ($leaf -match '^(?i).+\.dx90\.vtx$') { return 23 }
+    if ($leaf -match '^(?i).+\.sw\.vtx$') { return 24 }
+
+    switch ($ext) {
+        '.vmt' { return 10 }
+        '.vtf' { return 11 }
+        '.mdl' { return 20 }
+        '.vvd' { return 21 }
+        '.vtx' { return 25 }
+        '.phy' { return 26 }
+        default { return 99 }
+    }
+}
+
+function Get-ArchiveSortInfo {
+    param([string]$ArchivePath)
+
+    $normalized = $ArchivePath.Replace('\', '/').Trim('/')
+    $dir = [System.IO.Path]::GetDirectoryName((To-OsPath $normalized))
+    if ($null -eq $dir) { $dir = '' } else { $dir = $dir.Replace('\', '/') }
+    $name = [System.IO.Path]::GetFileName((To-OsPath $normalized))
+
+    return [pscustomobject]@{
+        Directory = $dir
+        Name = $name
+        SortDirectory = $dir.ToLowerInvariant()
+        SortBaseName = Get-ArchiveSortBaseName -Name $name
+        SortExtensionRank = Get-ArchiveSortExtensionRank -Name $name
+        SortName = $name.ToLowerInvariant()
+        SortFullPath = $normalized.ToLowerInvariant()
+    }
+}
+
+function Get-ArchivePathSortKey {
+    param([string]$ArchivePath)
+
+    $info = Get-ArchiveSortInfo -ArchivePath $ArchivePath
+    return ('{0}|{1}|{2:D3}|{3}' -f $info.SortDirectory, $info.SortBaseName, [int]$info.SortExtensionRank, $info.SortName)
+}
+
 function New-EntryRecord {
     param([string]$FullPath, [byte[]]$Data, [bool]$InOriginal, [bool]$Modified)
     $normalized = Normalize-ArchivePath -PathValue $FullPath
-    $osPath = To-OsPath $normalized
-    $dir = [System.IO.Path]::GetDirectoryName($osPath)
-    if ($null -eq $dir) { $dir = '' } else { $dir = $dir.Replace('\\', '/') }
-    $name = [System.IO.Path]::GetFileName($osPath)
+    $sortInfo = Get-ArchiveSortInfo -ArchivePath $normalized
     [pscustomobject]@{
         FullPath = $normalized
-        Directory = $dir
-        Name = $name
+        Directory = $sortInfo.Directory
+        Name = $sortInfo.Name
         Size = $Data.Length
-        Type = Get-EntryType -Name $name
+        Type = Get-EntryType -Name $sortInfo.Name
         Data = $Data
         InOriginal = $InOriginal
         Modified = $Modified
+        SortDirectory = $sortInfo.SortDirectory
+        SortBaseName = $sortInfo.SortBaseName
+        SortExtensionRank = $sortInfo.SortExtensionRank
+        SortName = $sortInfo.SortName
+        SortFullPath = $sortInfo.SortFullPath
     }
 }
 
@@ -1459,10 +2271,15 @@ function Get-ListSortMarker {
 function Refresh-ListHeaderUI {
     if (-not $script:ListHeaderPanel) { return }
 
-    $labels = @('In', 'Name', 'Path', 'Size', 'Type')
+    $labels = @('Name', 'Path', 'Size', 'Type')
     for ($i = 0; $i -lt $script:ListHeaderButtons.Count; $i++) {
         $btn = $script:ListHeaderButtons[$i]
         if (-not $btn) { continue }
+        if ($i -ge $labels.Count) {
+            $btn.Visible = $false
+            continue
+        }
+        $btn.Visible = $true
 
         $width = if ($script:ListView -and $script:ListView.Columns.Count -gt $i) {
             $script:ListView.Columns[$i].Width
@@ -1488,6 +2305,34 @@ function Set-ListSort {
     Refresh-ListHeaderUI
 }
 
+function Ensure-ListViewColumnSchema {
+    if (-not $script:ListView) { return }
+
+    $columns = @(
+        @{ Text = 'Name'; Width = 300 },
+        @{ Text = 'Path'; Width = 520 },
+        @{ Text = 'Size'; Width = 120 },
+        @{ Text = 'Type'; Width = 150 }
+    )
+
+    $needsReset = ($script:ListView.Columns.Count -ne $columns.Count)
+    if (-not $needsReset) {
+        for ($i = 0; $i -lt $columns.Count; $i++) {
+            if ($script:ListView.Columns[$i].Text -ne $columns[$i].Text) {
+                $needsReset = $true
+                break
+            }
+        }
+    }
+
+    if (-not $needsReset) { return }
+
+    $script:ListView.Columns.Clear()
+    foreach ($column in $columns) {
+        [void]$script:ListView.Columns.Add([string]$column.Text, [int]$column.Width)
+    }
+}
+
 function Ensure-BspLoaded {
     if (-not $script:State.BspRaw) { throw 'Load a BSP first.' }
 }
@@ -1509,7 +2354,7 @@ function Serialize-Header {
             $ms.Write($fourcc, 0, 4)
         }
         $ms.Write([BitConverter]::GetBytes([int]$MapRevision), 0, 4)
-        return $ms.ToArray()
+        return ,$ms.ToArray()
     } finally {
         $ms.Dispose()
     }
@@ -1517,8 +2362,7 @@ function Serialize-Header {
 
 function Parse-Bsp {
     param([string]$Path)
-    [void](Assert-FileSizeLimit -Path $Path -MaxBytes $MaxBspBytes -Label 'BSP')
-    $raw = [System.IO.File]::ReadAllBytes($Path)
+    $raw = Read-FileBytesResponsive -Path $Path -MaxBytes $MaxBspBytes -Label 'BSP'
     if ($raw.Length -lt $HeaderSize) { throw 'File is too small for a Source BSP.' }
     $ident = [System.Text.Encoding]::ASCII.GetString($raw, 0, 4)
     if ($ident -ne 'VBSP') { throw 'Invalid BSP identifier (expected VBSP).' }
@@ -1556,14 +2400,14 @@ function Get-LumpBytes {
     return Copy-ByteRange -Source $Raw -Start $l.fileofs -Length $l.filelen
 }
 
-function Read-PakEntries {
-    param([byte[]]$PakBytes)
-    $entries = [ordered]@{}
-    if ($PakBytes.Length -eq 0) { return $entries }
+function Read-PakEntriesFromStream {
+    param([System.IO.Stream]$Stream)
 
-    $ms = New-Object System.IO.MemoryStream(,$PakBytes)
+    $entries = [ordered]@{}
+    if ($null -eq $Stream -or $Stream.Length -eq 0) { return $entries }
+
     try {
-        $zip = New-Object System.IO.Compression.ZipArchive($ms, [System.IO.Compression.ZipArchiveMode]::Read, $false)
+        $zip = New-Object System.IO.Compression.ZipArchive($Stream, [System.IO.Compression.ZipArchiveMode]::Read, $true)
         try {
             if ($zip.Entries.Count -gt $MaxPakEntries) { throw "PAK has too many entries: $($zip.Entries.Count). Limit: $MaxPakEntries." }
             $totalUncompressed = 0L
@@ -1577,7 +2421,7 @@ function Read-PakEntries {
                 try {
                     $tmp = New-Object System.IO.MemoryStream
                     try {
-                        $stream.CopyTo($tmp)
+                        Copy-StreamToMemoryResponsive -InputStream $stream -OutputStream $tmp
                         $entries[$name] = New-EntryRecord -FullPath $name -Data $tmp.ToArray() -InOriginal:$true -Modified:$false
                     } finally { $tmp.Dispose() }
                 } finally { $stream.Dispose() }
@@ -1585,9 +2429,29 @@ function Read-PakEntries {
         } finally { $zip.Dispose() }
     } catch {
         throw "PAK lump could not be read safely: $($_.Exception.Message)"
-    } finally { $ms.Dispose() }
+    }
 
     return $entries
+}
+
+function Read-PakEntries {
+    param([byte[]]$PakBytes)
+    if ($PakBytes.Length -eq 0) { return [ordered]@{} }
+
+    $ms = New-Object System.IO.MemoryStream(,$PakBytes)
+    try { return Read-PakEntriesFromStream -Stream $ms }
+    finally { $ms.Dispose() }
+}
+
+function Read-PakEntriesFromBspLump {
+    param([byte[]]$Raw, [object[]]$Lumps, [int]$Index)
+
+    $l = $Lumps[$Index]
+    if ($l.filelen -eq 0) { return [ordered]@{} }
+
+    $ms = [System.IO.MemoryStream]::new($Raw, [int]$l.fileofs, [int]$l.filelen, $false)
+    try { return Read-PakEntriesFromStream -Stream $ms }
+    finally { $ms.Dispose() }
 }
 
 function Write-PakEntries {
@@ -1600,19 +2464,20 @@ function Write-PakEntries {
         $zip = New-Object System.IO.Compression.ZipArchive($ms, [System.IO.Compression.ZipArchiveMode]::Create, $true)
         try {
             foreach ($k in (@($Entries.Keys) | Sort-Object)) {
+                Pump-UiMessages
                 $rec = $Entries[$k]
-                $zentry = $zip.CreateEntry($k, [System.IO.Compression.CompressionLevel]::Optimal)
+                $zentry = $zip.CreateEntry($k, [System.IO.Compression.CompressionLevel]::Fastest)
                 $zstream = $zentry.Open()
                 try {
                     $bytes = [byte[]]$rec.Data
                     if ($bytes.Length -gt $MaxPakEntryBytes) { throw "PAK entry is too large: $k ($($bytes.Length) bytes). Limit: $MaxPakEntryBytes bytes." }
                     $totalUncompressed += [int64]$bytes.Length
                     if ($totalUncompressed -gt $MaxPakTotalBytes) { throw "PAK uncompressed total is too large. Limit: $MaxPakTotalBytes bytes." }
-                    if ($bytes.Length -gt 0) { $zstream.Write($bytes, 0, $bytes.Length) }
+                    Write-BytesToStreamResponsive -OutputStream $zstream -Bytes $bytes
                 } finally { $zstream.Dispose() }
             }
         } finally { $zip.Dispose() }
-        return $ms.ToArray()
+        return ,$ms.ToArray()
     } finally { $ms.Dispose() }
 }
 
@@ -1724,12 +2589,11 @@ function Get-SortedEntries {
     $desc = $script:State.SortDescending
 
     $sorted = switch ($column) {
-        0 { $all | Sort-Object @{Expression = { if ($_.InOriginal) { 1 } else { 0 } }}, @{Expression = { $_.FullPath }} }
-        1 { $all | Sort-Object @{Expression = { $_.Name }}, @{Expression = { $_.FullPath }} }
-        2 { $all | Sort-Object @{Expression = { $_.Directory }}, @{Expression = { $_.Name }} }
-        3 { $all | Sort-Object @{Expression = { $_.Size }}, @{Expression = { $_.FullPath }} }
-        4 { $all | Sort-Object @{Expression = { $_.Type }}, @{Expression = { $_.FullPath }} }
-        default { $all | Sort-Object FullPath }
+        0 { $all | Sort-Object SortBaseName, SortExtensionRank, SortDirectory, SortName }
+        1 { $all | Sort-Object SortDirectory, SortBaseName, SortExtensionRank, SortName }
+        2 { $all | Sort-Object @{Expression = { $_.Size }}, SortDirectory, SortBaseName, SortExtensionRank, SortName }
+        3 { $all | Sort-Object Type, SortDirectory, SortBaseName, SortExtensionRank, SortName }
+        default { $all | Sort-Object SortDirectory, SortBaseName, SortExtensionRank, SortName }
     }
 
     if ($desc) { [array]::Reverse($sorted) }
@@ -1740,11 +2604,11 @@ function Refresh-ListView {
     $script:ListView.BeginUpdate()
     try {
         $script:ListView.View = 'Details'
+        Ensure-ListViewColumnSchema
         $script:ListView.Items.Clear()
+        $items = New-Object 'System.Collections.Generic.List[System.Windows.Forms.ListViewItem]'
         foreach ($entry in (Get-SortedEntries)) {
-            $inMark = if ($entry.InOriginal) { 'X' } else { '' }
-            $item = New-Object System.Windows.Forms.ListViewItem($inMark)
-            [void]$item.SubItems.Add($entry.Name)
+            $item = New-Object System.Windows.Forms.ListViewItem($entry.Name)
             [void]$item.SubItems.Add($entry.Directory)
             [void]$item.SubItems.Add($entry.Size.ToString())
             [void]$item.SubItems.Add($entry.Type)
@@ -1754,11 +2618,15 @@ function Refresh-ListView {
             } else {
                 $item.ForeColor = $script:Theme.Text
             }
-            [void]$script:ListView.Items.Add($item)
+            [void]$items.Add($item)
+        }
+        if ($items.Count -gt 0) {
+            $script:ListView.Items.AddRange([System.Windows.Forms.ListViewItem[]]$items.ToArray())
         }
     } finally {
         $script:ListView.EndUpdate()
     }
+    Update-ListScrollBar
 }
 
 function Ensure-TreeFolderNode {
@@ -1822,7 +2690,9 @@ function Set-ViewMode {
     $script:State.ViewAsTree = $AsTree
     $script:TreeView.Visible = $AsTree
     $script:ListView.Visible = -not $AsTree
+    if ($script:ListBodyPanel) { $script:ListBodyPanel.Visible = -not $AsTree }
     if ($script:ListHeaderPanel) { $script:ListHeaderPanel.Visible = -not $AsTree }
+    if ($AsTree) { $script:TreeView.BringToFront() }
     if ($script:State.Entries.Count -gt 0) {
         if ($AsTree) { Refresh-TreeView }
         else {
@@ -1867,7 +2737,7 @@ function Save-CurrentBsp {
 
     if ($InPlace -and $CreateBackup) { [System.IO.File]::Copy($OutputPath, "$OutputPath.bak", $true) }
 
-    [System.IO.File]::WriteAllBytes($OutputPath, [byte[]]$result.Raw)
+    Write-FileBytesResponsive -Path $OutputPath -Bytes ([byte[]]$result.Raw)
     $script:State.BspRaw = [byte[]]$result.Raw
     $script:State.Lumps = $result.Lumps
     $script:State.CurrentBspPath = $OutputPath
@@ -1883,9 +2753,12 @@ function Open-Bsp {
     }
 
     $fullPath = [System.IO.Path]::GetFullPath($Path)
+    Update-Status "Loading BSP: $fullPath"
+    Pump-UiMessages -MinMilliseconds 0
     $parsed = Parse-Bsp -Path $fullPath
-    $pakBytes = Get-LumpBytes -Raw $parsed.Raw -Lumps $parsed.Lumps -Index $PakLumpIndex
-    $entries = Read-PakEntries -PakBytes $pakBytes
+    Update-Status 'Loading BSP: reading PAK entries...'
+    Pump-UiMessages -MinMilliseconds 0
+    $entries = Read-PakEntriesFromBspLump -Raw $parsed.Raw -Lumps $parsed.Lumps -Index $PakLumpIndex
 
     $script:State.CurrentBspPath = $fullPath
     $script:State.BspRaw = [byte[]]$parsed.Raw
@@ -1898,6 +2771,8 @@ function Open-Bsp {
     Refresh-ScanSummaryUI
 
     $script:PathBox.Text = $fullPath
+    Update-Status 'Loading BSP: rendering entry list...'
+    Pump-UiMessages -MinMilliseconds 0
     Refresh-AllViews
     Update-Status "BSP loaded: $fullPath"
 }
@@ -1908,7 +2783,7 @@ function Resolve-ArchivePathFromFile {
     $source = if ($UseGameRootFixup -and -not [string]::IsNullOrWhiteSpace($script:State.GameRoot)) { $script:State.GameRoot } else { $BasePath }
     $rel = Get-RelativePath -BasePath $source -FullPath $FilePath
     if ($null -eq $rel) { return $null }
-    return Normalize-ArchivePath -PathValue ($rel.Replace('\\', '/'))
+    return Normalize-ArchivePath -PathValue ($rel.Replace('\', '/'))
 }
 
 function Add-OrReplaceEntry {
@@ -1989,8 +2864,7 @@ function Add-FilesWithBase {
         $arc = Resolve-ArchivePathFromFile -FilePath $f -BasePath $BasePath -UseGameRootFixup:$UseGameRootFixup
         if ($null -eq $arc) { $skipped++; continue }
 
-        [void](Assert-FileSizeLimit -Path $f -MaxBytes $MaxPakEntryBytes -Label $arc)
-        $bytes = [System.IO.File]::ReadAllBytes($f)
+        $bytes = Read-FileBytesResponsive -Path $f -MaxBytes $MaxPakEntryBytes -Label $arc
         $kind = Add-OrReplaceEntry -ArchivePath $arc -Data $bytes
         if ($kind -eq 'Added') { $added++ } else { $replaced++ }
     }
@@ -2165,7 +3039,7 @@ function Edit-SelectedEntry {
     $newName = $txtName.Text.Trim()
     if ([string]::IsNullOrWhiteSpace($newName)) { Show-ErrorDialog -Message 'Name cannot be empty.'; return }
 
-    $newPath = $txtPath.Text.Trim().Replace('\\', '/')
+    $newPath = $txtPath.Text.Trim().Replace('\', '/')
     if ([string]::IsNullOrWhiteSpace($newPath)) { $combined = $newName } else { $combined = "$newPath/$newName" }
 
     try { $newKey = Normalize-ArchivePath -PathValue $combined }
@@ -2228,7 +3102,7 @@ function Extract-SelectedEntries {
 function Normalize-GameRef {
     param([string]$Value)
     if ([string]::IsNullOrWhiteSpace($Value)) { return $null }
-    $v = $Value.Trim().Trim('"').Replace('\\', '/')
+    $v = $Value.Trim().Trim('"').Replace('\', '/')
     while ($v.StartsWith('/')) { $v = $v.Substring(1) }
     if ([string]::IsNullOrWhiteSpace($v) -or $v.Contains('..') -or $v.Contains(':')) { return $null }
 
@@ -2254,13 +3128,35 @@ function Add-RefToSet {
 
 function Add-ModelWithCompanions {
     param([System.Collections.Generic.HashSet[string]]$Set, [string]$ModelPath)
-    $mdl = Normalize-GameRef -Value $ModelPath
+    if ([string]::IsNullOrWhiteSpace($ModelPath)) { return }
+    $candidate = $ModelPath.Trim().Trim('"').Replace('\', '/').Trim('/')
+    if ([string]::IsNullOrWhiteSpace($candidate)) { return }
+    if ([System.IO.Path]::GetExtension($candidate) -eq '') { $candidate += '.mdl' }
+
+    $mdl = Normalize-GameRef -Value $candidate
     if ($null -eq $mdl) { return }
     [void]$Set.Add($mdl)
     $base = ([System.IO.Path]::ChangeExtension($mdl, $null)).TrimEnd('.')
     if ([string]::IsNullOrWhiteSpace($base)) { return }
     foreach ($suffix in @('.vvd', '.phy', '.dx80.vtx', '.dx90.vtx', '.sw.vtx')) {
         [void]$Set.Add("${base}${suffix}")
+    }
+}
+
+function Add-ModelReference {
+    param([System.Collections.Generic.HashSet[string]]$Set, [string]$Value)
+
+    if ([string]::IsNullOrWhiteSpace($Value)) { return }
+    $candidate = $Value.Trim().Trim('"').Replace('\', '/').Trim('/')
+    if ([string]::IsNullOrWhiteSpace($candidate) -or $candidate.StartsWith('*')) { return }
+    if ($candidate -match '^[+-]?\d+$') { return }
+    if ($candidate.Contains('..') -or $candidate.Contains(':')) { return }
+
+    $ext = [System.IO.Path]::GetExtension($candidate).ToLowerInvariant()
+    if ([string]::IsNullOrWhiteSpace($ext)) {
+        Add-ModelWithCompanions -Set $Set -ModelPath $candidate
+    } elseif ($ext -eq '.mdl') {
+        Add-ModelWithCompanions -Set $Set -ModelPath $candidate
     }
 }
 
@@ -2271,6 +3167,176 @@ function Read-NullTerminatedString {
     while ($end -lt $Bytes.Length -and $Bytes[$end] -ne 0) { $end++ }
     if ($end -le $Offset) { return '' }
     return [System.Text.Encoding]::ASCII.GetString($Bytes, $Offset, ($end - $Offset))
+}
+
+function Read-NullTerminatedStringFromBytes {
+    param([byte[]]$Bytes)
+    if ($null -eq $Bytes -or $Bytes.Length -eq 0) { return '' }
+
+    $end = 0
+    while ($end -lt $Bytes.Length -and $Bytes[$end] -ne 0) { $end++ }
+    if ($end -le 0) { return '' }
+    return [System.Text.Encoding]::ASCII.GetString($Bytes, 0, $end)
+}
+
+function Read-NullTerminatedStringAt {
+    param([byte[]]$Bytes, [int]$Offset)
+
+    if ($null -eq $Bytes -or $Offset -lt 0 -or $Offset -ge $Bytes.Length) { return '' }
+    $end = $Offset
+    while ($end -lt $Bytes.Length -and $Bytes[$end] -ne 0) { $end++ }
+    if ($end -le $Offset) { return '' }
+    return [System.Text.Encoding]::ASCII.GetString($Bytes, $Offset, ($end - $Offset))
+}
+
+function Read-Int32LeSafe {
+    param([byte[]]$Bytes, [int]$Offset)
+
+    if ($null -eq $Bytes -or $Offset -lt 0 -or ($Offset + 4) -gt $Bytes.Length) { return $null }
+    return [BitConverter]::ToInt32($Bytes, $Offset)
+}
+
+function Add-MaterialRefToList {
+    param([System.Collections.Generic.List[string]]$Refs, [string]$Value)
+
+    if ([string]::IsNullOrWhiteSpace($Value)) { return }
+    $candidate = $Value.Trim().Trim('"').Replace('\', '/').Trim('/')
+    if ([string]::IsNullOrWhiteSpace($candidate) -or $candidate.Contains('..') -or $candidate.Contains(':')) { return }
+
+    $ext = [System.IO.Path]::GetExtension($candidate).ToLowerInvariant()
+    if ($ext -eq '.vtf') {
+        $candidate = [System.IO.Path]::ChangeExtension($candidate, '.vmt').Replace('\', '/')
+    } elseif ($ext -ne '.vmt') {
+        $candidate += '.vmt'
+    }
+
+    $ref = Normalize-GameRef -Value $candidate
+    if ($null -eq $ref) { return }
+    if ($ref -notmatch '^(?i)materials/') { $ref = "materials/$ref" }
+    [void]$Refs.Add($ref)
+}
+
+function Join-ModelMaterialPath {
+    param([string]$Directory, [string]$TextureName)
+
+    if ([string]::IsNullOrWhiteSpace($TextureName)) { return $null }
+    $texture = $TextureName.Trim().Trim('"').Replace('\', '/').Trim('/')
+    if ([string]::IsNullOrWhiteSpace($texture) -or $texture.Contains('..') -or $texture.Contains(':')) { return $null }
+    if ($texture -match '^(?i)materials/') { return $texture }
+    if ($texture -match '/') { return $texture }
+
+    $dir = ''
+    if (-not [string]::IsNullOrWhiteSpace($Directory)) {
+        $dir = $Directory.Trim().Trim('"').Replace('\', '/').Trim('/')
+        if ($dir -match '^(?i)materials/(.+)$') { $dir = $Matches[1] }
+    }
+    if ([string]::IsNullOrWhiteSpace($dir)) { return $texture }
+    return "$dir/$texture"
+}
+
+function Get-MdlMaterialRefsFromBytes {
+    param([byte[]]$Bytes)
+
+    $refs = New-Object System.Collections.Generic.List[string]
+    if ($null -eq $Bytes -or $Bytes.Length -lt 220) { return @() }
+
+    $id = [System.Text.Encoding]::ASCII.GetString($Bytes, 0, 4)
+    if ($id -ne 'IDST') { return @() }
+
+    $numTextures = Read-Int32LeSafe -Bytes $Bytes -Offset 204
+    $textureIndex = Read-Int32LeSafe -Bytes $Bytes -Offset 208
+    $numCdTextures = Read-Int32LeSafe -Bytes $Bytes -Offset 212
+    $cdTextureIndex = Read-Int32LeSafe -Bytes $Bytes -Offset 216
+
+    if ($null -eq $numTextures -or $null -eq $textureIndex -or $numTextures -lt 0 -or $numTextures -gt 4096) { return @() }
+    if ($null -eq $numCdTextures -or $null -eq $cdTextureIndex -or $numCdTextures -lt 0 -or $numCdTextures -gt 1024) { $numCdTextures = 0 }
+
+    $textureNames = New-Object System.Collections.Generic.List[string]
+    for ($i = 0; $i -lt $numTextures; $i++) {
+        $textureStruct = [int]$textureIndex + ($i * 64)
+        if ($textureStruct -lt 0 -or ($textureStruct + 64) -gt $Bytes.Length) { break }
+        $nameOffset = Read-Int32LeSafe -Bytes $Bytes -Offset $textureStruct
+        if ($null -eq $nameOffset) { continue }
+        $absoluteNameOffset = $textureStruct + [int]$nameOffset
+        $name = Read-NullTerminatedStringAt -Bytes $Bytes -Offset $absoluteNameOffset
+        if (-not [string]::IsNullOrWhiteSpace($name)) { [void]$textureNames.Add($name) }
+    }
+
+    if ($textureNames.Count -eq 0) { return @() }
+
+    $textureDirs = New-Object System.Collections.Generic.List[string]
+    if ($numCdTextures -gt 0 -and $cdTextureIndex -gt 0) {
+        for ($i = 0; $i -lt $numCdTextures; $i++) {
+            $offsetOffset = [int]$cdTextureIndex + ($i * 4)
+            $dirOffset = Read-Int32LeSafe -Bytes $Bytes -Offset $offsetOffset
+            if ($null -eq $dirOffset) { continue }
+            $dir = Read-NullTerminatedStringAt -Bytes $Bytes -Offset ([int]$dirOffset)
+            if (-not [string]::IsNullOrWhiteSpace($dir)) { [void]$textureDirs.Add($dir) }
+        }
+    }
+    if ($textureDirs.Count -eq 0) { [void]$textureDirs.Add('') }
+
+    foreach ($textureName in $textureNames) {
+        foreach ($textureDir in $textureDirs) {
+            $materialPath = Join-ModelMaterialPath -Directory $textureDir -TextureName $textureName
+            Add-MaterialRefToList -Refs $refs -Value $materialPath
+        }
+    }
+
+    return @([string[]]$refs.ToArray())
+}
+
+function Add-StaticPropModelReferences {
+    param([byte[]]$Raw, [object[]]$Lumps, [System.Collections.Generic.HashSet[string]]$Set)
+
+    if ($null -eq $Raw -or $null -eq $Lumps -or $Lumps.Count -le $GameLumpIndex) { return }
+    $gameLump = $Lumps[$GameLumpIndex]
+    if ($gameLump.filelen -lt 4) { return }
+
+    $gameStart = [int]$gameLump.fileofs
+    $gameEnd = $gameStart + [int]$gameLump.filelen
+    if ($gameStart -lt 0 -or $gameEnd -gt $Raw.Length) { return }
+
+    $ms = [System.IO.MemoryStream]::new($Raw, $gameStart, [int]$gameLump.filelen, $false)
+    $br = New-Object System.IO.BinaryReader($ms)
+    try {
+        $lumpCount = $br.ReadInt32()
+        if ($lumpCount -lt 0 -or $lumpCount -gt 1024) { return }
+
+        for ($i = 0; $i -lt $lumpCount; $i++) {
+            if (($ms.Length - $ms.Position) -lt 16) { return }
+            $id = $br.ReadUInt32()
+            [void]$br.ReadUInt16()
+            [void]$br.ReadUInt16()
+            $fileOfs = $br.ReadInt32()
+            $fileLen = $br.ReadInt32()
+
+            if ($id -ne $StaticPropGameLumpId) { continue }
+            if ($fileLen -lt 4 -or $fileOfs -lt 0 -or ($fileOfs + $fileLen) -gt $Raw.Length) { continue }
+
+            $sprpStream = [System.IO.MemoryStream]::new($Raw, $fileOfs, $fileLen, $false)
+            $sprpReader = New-Object System.IO.BinaryReader($sprpStream)
+            try {
+                $dictCount = $sprpReader.ReadInt32()
+                if ($dictCount -lt 0 -or $dictCount -gt 10000) { continue }
+
+                for ($d = 0; $d -lt $dictCount; $d++) {
+                    if (($sprpStream.Length - $sprpStream.Position) -lt 128) { break }
+                    $nameBytes = $sprpReader.ReadBytes(128)
+                    $modelName = Read-NullTerminatedStringFromBytes -Bytes $nameBytes
+                    Add-ModelReference -Set $Set -Value $modelName
+                }
+            } finally {
+                $sprpReader.Dispose()
+                $sprpStream.Dispose()
+            }
+        }
+    } catch {
+        return
+    } finally {
+        $br.Dispose()
+        $ms.Dispose()
+    }
 }
 
 function Collect-BspReferences {
@@ -2291,14 +3357,13 @@ function Collect-BspReferences {
             if ([string]::IsNullOrWhiteSpace($val)) { continue }
 
             switch ($key) {
-                'model' { if (-not $val.StartsWith('*') -and $val.ToLowerInvariant().EndsWith('.mdl')) { Add-ModelWithCompanions -Set $set -ModelPath $val } }
-                'gibmodel' { if ($val.ToLowerInvariant().EndsWith('.mdl')) { Add-ModelWithCompanions -Set $set -ModelPath $val } }
+                'model' { Add-ModelReference -Set $set -Value $val }
+                'gibmodel' { Add-ModelReference -Set $set -Value $val }
                 'detailmaterial' {
-                    if ($val -notmatch '\.vmt$') { Add-RefToSet -Set $set -Ref ("materials/$val.vmt") }
-                    else { Add-RefToSet -Set $set -Ref $val }
+                    Add-MaterialReference -Set $set -Value $val
                 }
                 'skyname' {
-                    $sky = $val.Replace('\\', '/').Trim('/')
+                    $sky = $val.Replace('\', '/').Trim('/')
                     if (-not [string]::IsNullOrWhiteSpace($sky)) {
                         foreach ($side in @('up', 'dn', 'lf', 'rt', 'ft', 'bk')) {
                             Add-RefToSet -Set $set -Ref ("materials/skybox/${sky}${side}.vmt")
@@ -2307,6 +3372,9 @@ function Collect-BspReferences {
                     }
                 }
                 default {
+                    if ($key -match '(?i)(texture|decal|overlay|material|sprite)' -and $val -match '[\\/]') {
+                        Add-MaterialReference -Set $set -Value $val
+                    }
                     $matches = [regex]::Matches($val, '([A-Za-z0-9_\-\/\.]+\.(vmt|vtf|mdl|wav|mp3|pcf|txt|vcd))', [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
                     foreach ($mv in $matches) {
                         $candidate = $mv.Groups[1].Value
@@ -2317,6 +3385,8 @@ function Collect-BspReferences {
             }
         }
     }
+
+    Add-StaticPropModelReferences -Raw $Raw -Lumps $Lumps -Set $set
 
     $strData = Get-LumpBytes -Raw $Raw -Lumps $Lumps -Index $TexDataStringDataLumpIndex
     $strTable = Get-LumpBytes -Raw $Raw -Lumps $Lumps -Index $TexDataStringTableLumpIndex
@@ -2344,7 +3414,7 @@ function Collect-BspReferences {
         Add-RefToSet -Set $set -Ref ("materials/overviews/${MapName}_radar.vtf")
     }
 
-    return $set
+    return ,$set
 }
 
 function Add-VmtDependencyRef {
@@ -2356,11 +3426,32 @@ function Add-VmtDependencyRef {
 
     if ([string]::IsNullOrWhiteSpace($Value)) { return }
     $candidate = $Value.Trim()
+    if ($candidate -match '^[+-]?(?:\d+(?:\.\d*)?|\.\d+)$') { return }
+    if ($candidate -match '^(?i)(env_cubemap|none|null|black|white)$') { return }
     if ($candidate -notmatch ([regex]::Escape($Extension) + '$')) { $candidate += $Extension }
     $ref = Normalize-GameRef -Value $candidate
     if ($null -eq $ref) { return }
     if ($ref -notmatch '^(?i)materials/') { $ref = "materials/$ref" }
     [void]$Refs.Add($ref)
+}
+
+function Add-MaterialReference {
+    param([System.Collections.Generic.HashSet[string]]$Set, [string]$Value)
+
+    if ([string]::IsNullOrWhiteSpace($Value)) { return }
+    $candidate = $Value.Trim().Trim('"').Replace('\', '/').Trim('/')
+    if ([string]::IsNullOrWhiteSpace($candidate) -or $candidate.Contains('..') -or $candidate.Contains(':')) { return }
+
+    $ext = [System.IO.Path]::GetExtension($candidate).ToLowerInvariant()
+    if ($candidate -match '^(?i)materials/(.+)$') { $candidate = $Matches[1] }
+
+    switch ($ext) {
+        '.vmt' { Add-RefToSet -Set $Set -Ref ("materials/$candidate") }
+        '.vtf' { Add-RefToSet -Set $Set -Ref ("materials/$candidate") }
+        default {
+            Add-RefToSet -Set $Set -Ref ("materials/$candidate.vmt")
+        }
+    }
 }
 
 function Get-RegexFirstValue {
@@ -2369,6 +3460,81 @@ function Get-RegexFirstValue {
         if ($Match.Groups[$index].Success) { return $Match.Groups[$index].Value }
     }
     return ''
+}
+
+function Test-VmtPathLikeValue {
+    param([string]$Value)
+
+    if ([string]::IsNullOrWhiteSpace($Value)) { return $false }
+    $candidate = $Value.Trim().Trim('"')
+    if ([string]::IsNullOrWhiteSpace($candidate)) { return $false }
+    if ($candidate -match '^[+-]?(?:\d+(?:\.\d*)?|\.\d+)$') { return $false }
+    if ($candidate -match '^[\{\[]?[+-]?\d+(?:\.\d+)?(?:\s+[+-]?\d+(?:\.\d+)?)+[\}\]]?$') { return $false }
+    if ($candidate -match '^(?i)(env_cubemap|none|null|black|white)$') { return $false }
+    if ($candidate -match '^(?i)[A-Za-z_][A-Za-z0-9_]*$') { return $false }
+    return ($candidate -match '[\\/]' -or $candidate -match '(?i)\.(vmt|vtf)$')
+}
+
+function Get-VmtDependencyRefsFromContent {
+    param([string]$Content)
+
+    if ([string]::IsNullOrWhiteSpace($Content)) { return @() }
+
+    $refs = New-Object System.Collections.Generic.List[string]
+    $textureKeys = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($k in @(
+        'basetexture',
+        'basetexture2',
+        'texture2',
+        'bumpmap',
+        'bumpmap2',
+        'normalmap',
+        'envmapmask',
+        'detail',
+        'envmap',
+        'selfillummask',
+        'selfillumtexture',
+        'flowmap',
+        'dudvmap',
+        'lightwarptexture',
+        'phongexponenttexture',
+        'iris',
+        'blendmodulatetexture',
+        'ambientocclusiontexture',
+        'flashlighttexture',
+        'refracttexture',
+        'reflecttexture',
+        'blurtexture',
+        'normalmapalphaenvmapmask',
+        'basetexturenoenvmap'
+    )) {
+        [void]$textureKeys.Add($k)
+    }
+
+    $includes = [regex]::Matches($Content, '(?im)^\s*"?include"?\s+(?:"([^"]+)"|([^\s{}]+))')
+    foreach ($m in $includes) {
+        Add-VmtDependencyRef -Refs $refs -Value (Get-RegexFirstValue -Match $m -GroupIndexes @(1, 2)) -Extension '.vmt'
+    }
+
+    $tex = [regex]::Matches($Content, '(?im)^\s*"?\$([A-Za-z0-9_]+)"?\s+(?:"([^"]+)"|([^\s{}]+))')
+    foreach ($m in $tex) {
+        $key = $m.Groups[1].Value.ToLowerInvariant()
+        $value = Get-RegexFirstValue -Match $m -GroupIndexes @(2, 3)
+        if ($textureKeys.Contains($key)) {
+            Add-VmtDependencyRef -Refs $refs -Value $value -Extension '.vtf'
+        } elseif ($key -eq 'bottommaterial' -or $key -eq 'crackmaterial') {
+            Add-VmtDependencyRef -Refs $refs -Value $value -Extension '.vmt'
+        } elseif (Test-VmtPathLikeValue -Value $value) {
+            $extension = [System.IO.Path]::GetExtension($value).ToLowerInvariant()
+            if ($extension -eq '.vmt') {
+                Add-VmtDependencyRef -Refs $refs -Value $value -Extension '.vmt'
+            } else {
+                Add-VmtDependencyRef -Refs $refs -Value $value -Extension '.vtf'
+            }
+        }
+    }
+
+    return @([string[]]$refs.ToArray())
 }
 
 function Get-VmtDependencyRefs {
@@ -2394,31 +3560,107 @@ function Get-VmtDependencyRefs {
     try { $content = [System.IO.File]::ReadAllText($fullPath) }
     catch { return @() }
 
-    $refs = New-Object System.Collections.Generic.List[string]
+    $refs = [string[]](Get-VmtDependencyRefsFromContent -Content $content)
 
-    $includes = [regex]::Matches($content, '(?im)^\s*"?include"?\s+(?:"([^"]+)"|([^\s{}]+))')
-    foreach ($m in $includes) {
-        Add-VmtDependencyRef -Refs $refs -Value (Get-RegexFirstValue -Match $m -GroupIndexes @(1, 2)) -Extension '.vmt'
-    }
-
-    $tex = [regex]::Matches($content, '(?im)^\s*"?\$([A-Za-z0-9_]+)"?\s+(?:"([^"]+)"|([^\s{}]+))')
-    foreach ($m in $tex) {
-        $key = $m.Groups[1].Value.ToLowerInvariant()
-        $value = Get-RegexFirstValue -Match $m -GroupIndexes @(2, 3)
-        if ($key -match 'texture|bump|normal|envmapmask|detail|selfillum|flowmap|dudv|lightwarp|phongexponent|iris') {
-            Add-VmtDependencyRef -Refs $refs -Value $value -Extension '.vtf'
-        } elseif ($key -eq 'bottommaterial') {
-            Add-VmtDependencyRef -Refs $refs -Value $value -Extension '.vmt'
-        }
-    }
-
-    $result = [string[]]$refs.ToArray()
+    $result = [string[]]$refs
     $script:VmtDependencyCache[$fullPath] = [pscustomobject]@{
         Length = [int64]$info.Length
         LastWriteUtcTicks = [int64]$info.LastWriteTimeUtc.Ticks
         Refs = $result
     }
     return @($result)
+}
+
+function Get-PakTextEntry {
+    param([string]$ArchivePath)
+
+    if ([string]::IsNullOrWhiteSpace($ArchivePath) -or -not $script:State.Entries.Contains($ArchivePath)) { return $null }
+    $entry = $script:State.Entries[$ArchivePath]
+    if ($null -eq $entry -or $null -eq $entry.Data) { return $null }
+
+    $bytes = [byte[]]$entry.Data
+    if ($bytes.Length -eq 0 -or $bytes.Length -gt 1048576) { return $null }
+    foreach ($b in $bytes) {
+        if ($b -eq 0) { return $null }
+    }
+
+    try { return [System.Text.Encoding]::UTF8.GetString($bytes) }
+    catch {
+        try { return [System.Text.Encoding]::ASCII.GetString($bytes) }
+        catch { return $null }
+    }
+}
+
+function Get-PakBinaryEntry {
+    param([string]$ArchivePath)
+
+    if ([string]::IsNullOrWhiteSpace($ArchivePath) -or -not $script:State.Entries.Contains($ArchivePath)) { return $null }
+    $entry = $script:State.Entries[$ArchivePath]
+    if ($null -eq $entry -or $null -eq $entry.Data) { return $null }
+    return [byte[]]$entry.Data
+}
+
+function Get-MdlMaterialRefs {
+    param([string]$Path)
+
+    if ([string]::IsNullOrWhiteSpace($Path)) { return @() }
+
+    try {
+        $info = New-Object System.IO.FileInfo($Path)
+        if (-not $info.Exists) { return @() }
+        if ($info.Length -le 0 -or $info.Length -gt $MaxPakEntryBytes) { return @() }
+    } catch {
+        return @()
+    }
+
+    $fullPath = $info.FullName
+    $cacheKey = "mdl::$fullPath"
+    if ($script:VmtDependencyCache.ContainsKey($cacheKey)) {
+        $cached = $script:VmtDependencyCache[$cacheKey]
+        if ($cached.Length -eq $info.Length -and $cached.LastWriteUtcTicks -eq $info.LastWriteTimeUtc.Ticks) {
+            return @($cached.Refs)
+        }
+    }
+
+    try { $bytes = Read-FileBytesResponsive -Path $fullPath -MaxBytes $MaxPakEntryBytes -Label $fullPath }
+    catch { return @() }
+
+    $refs = [string[]](Get-MdlMaterialRefsFromBytes -Bytes $bytes)
+    $script:VmtDependencyCache[$cacheKey] = [pscustomobject]@{
+        Length = [int64]$info.Length
+        LastWriteUtcTicks = [int64]$info.LastWriteTimeUtc.Ticks
+        Refs = $refs
+    }
+    return @($refs)
+}
+
+function Expand-ModelMaterialDependencies {
+    param([System.Collections.Generic.HashSet[string]]$Set, [string]$GameRoot)
+    if ($null -eq $Set) { return }
+
+    $modelRefs = @($Set | Where-Object { [System.IO.Path]::GetExtension([string]$_).ToLowerInvariant() -eq '.mdl' })
+    foreach ($modelRef in $modelRefs) {
+        Pump-UiMessages
+        $materialRefs = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+
+        if (-not [string]::IsNullOrWhiteSpace($GameRoot) -and [System.IO.Directory]::Exists($GameRoot)) {
+            $modelPath = Join-Path $GameRoot (To-OsPath $modelRef)
+            foreach ($matRef in (Get-MdlMaterialRefs -Path $modelPath)) {
+                if (-not [string]::IsNullOrWhiteSpace($matRef)) { [void]$materialRefs.Add($matRef) }
+            }
+        }
+
+        $pakModel = Get-PakBinaryEntry -ArchivePath $modelRef
+        if ($null -ne $pakModel) {
+            foreach ($matRef in (Get-MdlMaterialRefsFromBytes -Bytes $pakModel)) {
+                if (-not [string]::IsNullOrWhiteSpace($matRef)) { [void]$materialRefs.Add($matRef) }
+            }
+        }
+
+        foreach ($matRef in $materialRefs) {
+            [void]$Set.Add($matRef)
+        }
+    }
 }
 
 function Expand-VmtDependencies {
@@ -2435,7 +3677,26 @@ function Expand-VmtDependencies {
         if (-not $visited.Add($vmtRef)) { continue }
 
         $vmtPath = Join-Path $GameRoot (To-OsPath $vmtRef)
+        $depRefs = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
         foreach ($depRef in (Get-VmtDependencyRefs -Path $vmtPath)) {
+            if (-not [string]::IsNullOrWhiteSpace($depRef)) { [void]$depRefs.Add($depRef) }
+        }
+        $pakVmt = Get-PakTextEntry -ArchivePath $vmtRef
+        if (-not [string]::IsNullOrWhiteSpace($pakVmt)) {
+            foreach ($depRef in (Get-VmtDependencyRefsFromContent -Content $pakVmt)) {
+                if (-not [string]::IsNullOrWhiteSpace($depRef)) { [void]$depRefs.Add($depRef) }
+            }
+        }
+
+        $sameBaseVtf = [System.IO.Path]::ChangeExtension($vmtRef, '.vtf').Replace('\', '/')
+        if (-not [string]::IsNullOrWhiteSpace($sameBaseVtf)) {
+            $sameBaseDiskPath = Join-Path $GameRoot (To-OsPath $sameBaseVtf)
+            if ([System.IO.File]::Exists($sameBaseDiskPath) -or $script:State.Entries.Contains($sameBaseVtf)) {
+                [void]$depRefs.Add($sameBaseVtf)
+            }
+        }
+
+        foreach ($depRef in $depRefs) {
             if ([string]::IsNullOrWhiteSpace($depRef)) { continue }
             if ($Set.Add($depRef) -and [System.IO.Path]::GetExtension($depRef).ToLowerInvariant() -eq '.vmt') {
                 $queue.Enqueue($depRef)
@@ -2472,6 +3733,9 @@ function Invoke-Scan {
     Update-Status 'Scan: reading BSP references...'
     Pump-UiMessages -MinMilliseconds 0
     $refs = Collect-BspReferences -Raw $script:State.BspRaw -Lumps $script:State.Lumps -MapName $mapName -IncludeExtras:$script:State.IncludeExtrasInScan
+    Update-Status 'Scan: expanding model materials...'
+    Pump-UiMessages -MinMilliseconds 0
+    Expand-ModelMaterialDependencies -Set $refs -GameRoot $gameRoot
     Update-Status 'Scan: expanding material dependencies...'
     Pump-UiMessages -MinMilliseconds 0
     Expand-VmtDependencies -Set $refs -GameRoot $gameRoot
@@ -2483,7 +3747,7 @@ function Invoke-Scan {
     Pump-UiMessages -MinMilliseconds 0
     $rows = New-Object System.Collections.Generic.List[object]
     $diskExistsCache = @{}
-    foreach ($r in ($refs | Sort-Object)) {
+    foreach ($r in ($refs | Sort-Object @{Expression = { Get-ArchivePathSortKey -ArchivePath $_ }})) {
         Pump-UiMessages
         $inPak = $script:State.Entries.Contains($r)
         $full = Join-Path $gameRoot (To-OsPath $r)
@@ -2551,8 +3815,7 @@ function Add-ScanResults {
         if (-not [System.IO.File]::Exists($row.FullDiskPath)) { $missingOnDisk++; continue }
 
         try {
-            [void](Assert-FileSizeLimit -Path $row.FullDiskPath -MaxBytes $MaxPakEntryBytes -Label $row.Path)
-            $bytes = [System.IO.File]::ReadAllBytes($row.FullDiskPath)
+            $bytes = Read-FileBytesResponsive -Path $row.FullDiskPath -MaxBytes $MaxPakEntryBytes -Label $row.Path
             $res = Add-OrReplaceEntry -ArchivePath $row.Path -Data $bytes
             if ($res -eq 'Added') { $added++ } else { $replaced++ }
         } catch {
@@ -2588,21 +3851,85 @@ function Show-ScanDialog {
     $dlg.Width = 980
     $dlg.Height = 640
 
+    $bodyPanel = New-Object System.Windows.Forms.Panel
+    $bodyPanel.Dock = 'Fill'
+    $dlg.Controls.Add($bodyPanel)
+
+    $scanRowsPanel = New-Object System.Windows.Forms.Panel
+    $scanRowsPanel.Dock = 'Fill'
+    $bodyPanel.Controls.Add($scanRowsPanel)
+
+    $scanHeaderPanel = New-Object System.Windows.Forms.Panel
+    $scanHeaderPanel.Dock = 'Top'
+    $scanHeaderPanel.Height = 24
+    $scanHeaderPanel.BackColor = $script:Theme.Header
+    $bodyPanel.Controls.Add($scanHeaderPanel)
+    $bodyPanel.Controls.SetChildIndex($scanRowsPanel, 0)
+    $bodyPanel.Controls.SetChildIndex($scanHeaderPanel, 1)
+
+    $scanScrollBar = New-Object PakRatWheelPanel
+    $scanScrollBar.Dock = 'Right'
+    $scanScrollBar.Width = 22
+    $scanScrollBar.BackColor = $script:Theme.Panel
+    $scanScrollBar.Visible = $false
+    $scanRowsPanel.Controls.Add($scanScrollBar)
+
+    $scanScrollTrack = New-Object PakRatWheelPanel
+    $scanScrollTrack.Dock = 'Fill'
+    $scanScrollTrack.BackColor = $script:Theme.Header
+    $scanScrollBar.Controls.Add($scanScrollTrack)
+
+    $scanScrollThumb = New-Object PakRatWheelPanel
+    $scanScrollThumb.Left = 3
+    $scanScrollThumb.Top = 0
+    $scanScrollThumb.Width = 16
+    $scanScrollThumb.Height = 48
+    $scanScrollThumb.BackColor = [System.Drawing.Color]::FromArgb(88, 94, 106)
+    $scanScrollTrack.Controls.Add($scanScrollThumb)
+
     $lv = New-Object System.Windows.Forms.ListView
     $lv.Dock = 'Fill'
     $lv.View = 'Details'
+    $lv.HeaderStyle = 'None'
     $lv.FullRowSelect = $true
     $lv.GridLines = $false
     [void]$lv.Columns.Add('Path', 620)
     [void]$lv.Columns.Add('Status', 180)
     [void]$lv.Columns.Add('In PAK', 70)
     [void]$lv.Columns.Add('On disk', 70)
-    $dlg.Controls.Add($lv)
+    $scanRowsPanel.Controls.Add($lv)
+    $scanRowsPanel.Controls.SetChildIndex($lv, 0)
+    $scanRowsPanel.Controls.SetChildIndex($scanScrollBar, 1)
+    $scanScrollBar.BringToFront()
+
+    $scanHeaderLeft = 0
+    $scanHeaderSpecs = @(
+        @{ Text = 'Path'; Width = 620 },
+        @{ Text = 'Status'; Width = 180 },
+        @{ Text = 'In PAK'; Width = 70 },
+        @{ Text = 'On disk'; Width = 70 }
+    )
+    foreach ($spec in $scanHeaderSpecs) {
+        $header = New-Object System.Windows.Forms.Label
+        $header.Left = $scanHeaderLeft
+        $header.Top = 0
+        $header.Width = [int]$spec.Width
+        $header.Height = $scanHeaderPanel.Height
+        $header.Text = [string]$spec.Text
+        $header.TextAlign = 'MiddleLeft'
+        $header.Padding = New-Object System.Windows.Forms.Padding(4, 0, 4, 0)
+        $header.BackColor = $script:Theme.Header
+        $header.ForeColor = $script:Theme.Text
+        $scanHeaderPanel.Controls.Add($header)
+        $scanHeaderLeft += [int]$spec.Width
+    }
 
     $panel = New-Object System.Windows.Forms.Panel
     $panel.Dock = 'Bottom'
     $panel.Height = 54
     $dlg.Controls.Add($panel)
+    $dlg.Controls.SetChildIndex($bodyPanel, 0)
+    $dlg.Controls.SetChildIndex($panel, 1)
 
     $addBtn = New-Object System.Windows.Forms.Button
     $addBtn.Text = 'Add all'
@@ -2639,6 +3966,85 @@ function Show-ScanDialog {
     $closeBtn.Width = 110
     $panel.Controls.Add($closeBtn)
 
+    $script:ScanDialogScrollDragging = $false
+    $script:ScanDialogScrollDragOffsetY = 0
+    $getScanRowHeight = {
+        if ($lv.Items.Count -eq 0) { return 18 }
+        try {
+            $rect = $lv.GetItemRect(0)
+            if ($rect.Height -gt 0) { return $rect.Height }
+        } catch { }
+        return 18
+    }
+    $getScanVisibleRows = {
+        $rowHeight = & $getScanRowHeight
+        return [Math]::Max(1, [int][Math]::Floor($lv.ClientSize.Height / [double]$rowHeight))
+    }
+    $getScanTopIndex = {
+        if ($lv.Items.Count -eq 0) { return 0 }
+        try {
+            if ($lv.TopItem) { return [int]$lv.TopItem.Index }
+        } catch { }
+        return 0
+    }
+    $updateScanScroll = {
+        Hide-NativeListViewScrollBars -ListView $lv
+        $scanScrollBar.BackColor = $script:Theme.Panel
+        $scanScrollTrack.BackColor = $script:Theme.ScrollTrack
+        $scanScrollThumb.BackColor = $script:Theme.ScrollThumb
+        $total = [int]$lv.Items.Count
+        $visibleRows = & $getScanVisibleRows
+        $needsScroll = ($total -gt $visibleRows)
+        $scanScrollBar.Visible = $needsScroll
+        if (-not $needsScroll) { return }
+
+        $trackHeight = [Math]::Max(1, $scanScrollTrack.ClientSize.Height)
+        $thumbHeight = [Math]::Max(44, [int][Math]::Floor($trackHeight * ($visibleRows / [double]$total)))
+        $thumbHeight = [Math]::Min($trackHeight, $thumbHeight)
+        $range = [Math]::Max(0, $trackHeight - $thumbHeight)
+        $maxTop = [Math]::Max(1, $total - $visibleRows)
+        $topIndex = [Math]::Max(0, [Math]::Min((& $getScanTopIndex), $maxTop))
+        $thumbTop = if ($range -gt 0) { [int][Math]::Round($range * ($topIndex / [double]$maxTop)) } else { 0 }
+
+        $scanScrollThumb.Left = 3
+        $scanScrollThumb.Width = [Math]::Max(10, $scanScrollTrack.ClientSize.Width - 6)
+        $scanScrollThumb.Height = $thumbHeight
+        $scanScrollThumb.Top = $thumbTop
+    }
+    $scrollScanToTopIndex = {
+        param([int]$Index)
+        if ($lv.Items.Count -eq 0) { return }
+        $visibleRows = & $getScanVisibleRows
+        $maxTop = [Math]::Max(0, $lv.Items.Count - $visibleRows)
+        $target = [Math]::Max(0, [Math]::Min($Index, $maxTop))
+        try { $lv.TopItem = $lv.Items[$target] }
+        catch { try { $lv.EnsureVisible($target) } catch { } }
+        & $updateScanScroll
+    }
+    $scrollScanFromThumbY = {
+        param([int]$ThumbY)
+        if ($lv.Items.Count -eq 0) { return }
+        $visibleRows = & $getScanVisibleRows
+        $maxTop = [Math]::Max(0, $lv.Items.Count - $visibleRows)
+        $range = [Math]::Max(1, $scanScrollTrack.ClientSize.Height - $scanScrollThumb.Height)
+        $clampedY = [Math]::Max(0, [Math]::Min($ThumbY, $range))
+        $target = [int][Math]::Round($maxTop * ($clampedY / [double]$range))
+        & $scrollScanToTopIndex $target
+    }
+    $scrollScanByRows = {
+        param([int]$Rows)
+        & $scrollScanToTopIndex ((& $getScanTopIndex) + $Rows)
+    }
+    $scrollScanByWheelDelta = {
+        param([int]$Delta)
+        $rows = Get-MouseWheelScrollRows -Delta $Delta -VisibleRows (& $getScanVisibleRows)
+        if ($rows -eq 0) {
+            & $updateScanScroll
+            return
+        }
+        & $scrollScanByRows $rows
+    }
+
     $refreshList = {
         $lv.BeginUpdate()
         try {
@@ -2660,6 +4066,7 @@ function Show-ScanDialog {
         } finally {
             $lv.EndUpdate()
         }
+        & $updateScanScroll
     }
 
     $addBtn.Add_Click({ $dlg.Tag = 'add'; $dlg.Close() })
@@ -2705,6 +4112,69 @@ function Show-ScanDialog {
             Show-ErrorDialog -Message $_.Exception.Message
         }
     })
+
+    $lv.Add_HandleCreated({ & $updateScanScroll })
+    $lv.Add_SizeChanged({ & $updateScanScroll })
+    $lv.Add_MouseEnter({ [void]$lv.Focus() })
+    $lv.Add_MouseWheel({
+        param($sender, $eventArgs)
+        & $scrollScanByWheelDelta $eventArgs.Delta
+        Set-MouseWheelHandled -EventArgs $eventArgs
+        try { [void]$lv.BeginInvoke([System.Windows.Forms.MethodInvoker]{ & $updateScanScroll }) }
+        catch { & $updateScanScroll }
+    })
+    $lv.Add_KeyUp({ & $updateScanScroll })
+    $lv.Add_SelectedIndexChanged({ & $updateScanScroll })
+    $scanScrollTrack.Add_SizeChanged({ & $updateScanScroll })
+    foreach ($scanScrollControl in @($scanScrollBar, $scanScrollTrack, $scanScrollThumb)) {
+        $scanScrollControl.TabStop = $true
+        $scanScrollControl.Add_MouseEnter({ Set-WheelFocus -Control $this })
+        $scanScrollControl.Add_MouseDown({ Set-WheelFocus -Control $this })
+        $scanScrollControl.Add_MouseUp({ Set-WheelFocus -Control $this })
+        $scanScrollControl.Add_MouseWheel({
+            param($sender, $eventArgs)
+            Set-WheelFocus -Control $sender
+            & $scrollScanByWheelDelta $eventArgs.Delta
+            Set-MouseWheelHandled -EventArgs $eventArgs
+        })
+    }
+    $scanScrollTrack.Add_MouseDown({
+        if ($_.Button -ne [System.Windows.Forms.MouseButtons]::Left) { return }
+        Set-WheelFocus -Control $this
+        if ($scanScrollThumb.Bounds.Contains($_.Location)) {
+            $script:ScanDialogScrollDragging = $true
+            $script:ScanDialogScrollDragOffsetY = $_.Y - $scanScrollThumb.Top
+        } elseif ($_.Y -lt $scanScrollThumb.Top) {
+            & $scrollScanByRows (-( & $getScanVisibleRows ))
+        } else {
+            & $scrollScanByRows (& $getScanVisibleRows)
+        }
+    })
+    $scanScrollTrack.Add_MouseMove({
+        if (-not $script:ScanDialogScrollDragging) { return }
+        & $scrollScanFromThumbY ($_.Y - $script:ScanDialogScrollDragOffsetY)
+    })
+    $scanScrollTrack.Add_MouseUp({
+        $script:ScanDialogScrollDragging = $false
+        Set-WheelFocus -Control $this
+    })
+    $scanScrollThumb.Add_MouseDown({
+        if ($_.Button -ne [System.Windows.Forms.MouseButtons]::Left) { return }
+        Set-WheelFocus -Control $this
+        $script:ScanDialogScrollDragging = $true
+        $script:ScanDialogScrollDragOffsetY = $_.Y
+    })
+    $scanScrollThumb.Add_MouseMove({
+        if (-not $script:ScanDialogScrollDragging) { return }
+        $screenPoint = $scanScrollThumb.PointToScreen($_.Location)
+        $trackPoint = $scanScrollTrack.PointToClient($screenPoint)
+        & $scrollScanFromThumbY ($trackPoint.Y - $script:ScanDialogScrollDragOffsetY)
+    })
+    $scanScrollThumb.Add_MouseUp({
+        $script:ScanDialogScrollDragging = $false
+        Set-WheelFocus -Control $this
+    })
+    $dlg.Add_MouseUp({ $script:ScanDialogScrollDragging = $false })
 
     & $refreshList
 
@@ -2831,21 +4301,52 @@ function Browse-BspFile {
     }
 }
 
+function Show-ExplorerFolderDialog {
+    param(
+        [string]$Title = 'Select folder',
+        [string]$InitialDirectory = ''
+    )
+
+    try {
+        $owner = if ($script:MainForm -and $script:MainForm.Handle -ne [IntPtr]::Zero) { $script:MainForm.Handle } else { [IntPtr]::Zero }
+        $selected = [PakRatFolderPicker]::PickFolder($Title, $InitialDirectory, $owner)
+        if (-not [string]::IsNullOrWhiteSpace($selected) -and [System.IO.Directory]::Exists($selected)) {
+            return $selected
+        }
+
+        return $null
+    } catch {
+        Write-StartupLog -Message 'Modern folder picker failed; falling back to FolderBrowserDialog.' -Exception $_.Exception
+
+        $dlg = New-Object System.Windows.Forms.FolderBrowserDialog
+        $dlg.Description = $Title
+        $dlg.ShowNewFolderButton = $false
+        try { $dlg.AutoUpgradeEnabled = $true } catch { }
+        if (-not [string]::IsNullOrWhiteSpace($InitialDirectory) -and (Test-Path -LiteralPath $InitialDirectory -PathType Container)) {
+            $dlg.SelectedPath = $InitialDirectory
+        }
+
+        if ($dlg.ShowDialog() -ne [System.Windows.Forms.DialogResult]::OK) { return $null }
+        if ([System.IO.Directory]::Exists($dlg.SelectedPath)) { return $dlg.SelectedPath }
+        return $null
+    }
+}
+
 function Browse-GameRoot {
-    $dlg = New-Object System.Windows.Forms.FolderBrowserDialog
-    $dlg.Description = 'Select Game Path folder (hl2/cstrike/etc)'
+    $initialDirectory = ''
     if ($script:GameRootBox -and -not [string]::IsNullOrWhiteSpace($script:GameRootBox.Text) -and (Test-Path $script:GameRootBox.Text -PathType Container)) {
-        $dlg.SelectedPath = $script:GameRootBox.Text
+        $initialDirectory = $script:GameRootBox.Text
     } elseif (-not [string]::IsNullOrWhiteSpace($script:State.GameRoot) -and (Test-Path $script:State.GameRoot -PathType Container)) {
-        $dlg.SelectedPath = $script:State.GameRoot
+        $initialDirectory = $script:State.GameRoot
     }
 
-    if ($dlg.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
-        if (Set-CurrentGameRoot -PathValue $dlg.SelectedPath -Persist:$true) {
-            Update-Status "Game Path set: $($script:State.GameRoot)"
-        } else {
-            Show-ErrorDialog -Message 'Invalid Game Path folder.'
-        }
+    $selectedPath = Show-ExplorerFolderDialog -Title 'Select Game Path folder' -InitialDirectory $initialDirectory
+    if ($null -eq $selectedPath) { return }
+
+    if (Set-CurrentGameRoot -PathValue $selectedPath -Persist:$true) {
+        Update-Status "Game Path set: $($script:State.GameRoot)"
+    } else {
+        Show-ErrorDialog -Message 'Invalid Game Path folder.'
     }
 }
 
@@ -3011,6 +4512,7 @@ function Save-BspAs {
         $script:PathBox.Text = $dlg.FileName
         Refresh-AllViews
         Update-Status "Saved: $($dlg.FileName)"
+        Show-InfoDialog -Message "BSP saved successfully.`r`n`r`n$($dlg.FileName)"
     } catch { Show-ErrorDialog -Message $_.Exception.Message }
 }
 
@@ -3029,7 +4531,9 @@ function Save-BspInPlaceCore {
 
 function Save-BspInPlace {
     try {
-        [void](Save-BspInPlaceCore -ConfirmOverwrite:$true)
+        if (Save-BspInPlaceCore -ConfirmOverwrite:$true) {
+            Show-InfoDialog -Message "BSP saved successfully.`r`n`r`n$($script:State.CurrentBspPath)"
+        }
     } catch { Show-ErrorDialog -Message $_.Exception.Message }
 }
 
@@ -3159,9 +4663,10 @@ function Show-PreferencesDialog {
     $dlg.Controls.Add($cancel)
 
     $browseRoot.Add_Click({
-        $fd = New-Object System.Windows.Forms.FolderBrowserDialog
-        if (-not [string]::IsNullOrWhiteSpace($txtRoot.Text) -and (Test-Path $txtRoot.Text -PathType Container)) { $fd.SelectedPath = $txtRoot.Text }
-        if ($fd.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { $txtRoot.Text = $fd.SelectedPath }
+        $initialDirectory = ''
+        if (-not [string]::IsNullOrWhiteSpace($txtRoot.Text) -and (Test-Path $txtRoot.Text -PathType Container)) { $initialDirectory = $txtRoot.Text }
+        $selectedPath = Show-ExplorerFolderDialog -Title 'Select Game Path folder' -InitialDirectory $initialDirectory
+        if ($null -ne $selectedPath) { $txtRoot.Text = $selectedPath }
     })
 
     if ((Show-DarkDialog -Dialog $dlg) -ne [System.Windows.Forms.DialogResult]::OK) { return }
@@ -3192,6 +4697,8 @@ function Show-About {
     ) -join "`r`n"
     Show-InfoDialog -Message $msg
 }
+
+Enable-NativeDarkAppMode
 
 $form = New-Object System.Windows.Forms.Form
 $form.StartPosition = 'CenterScreen'
@@ -3398,6 +4905,39 @@ $mainPanel = New-Object System.Windows.Forms.Panel
 $mainPanel.Dock = 'Fill'
 $form.Controls.Add($mainPanel)
 
+$listBodyPanel = New-Object System.Windows.Forms.Panel
+$listBodyPanel.Dock = 'Fill'
+$mainPanel.Controls.Add($listBodyPanel)
+$script:ListBodyPanel = $listBodyPanel
+
+$listRowsPanel = New-Object System.Windows.Forms.Panel
+$listRowsPanel.Dock = 'Fill'
+$listBodyPanel.Controls.Add($listRowsPanel)
+$script:ListRowsPanel = $listRowsPanel
+
+$listScrollBar = New-Object PakRatWheelPanel
+$listScrollBar.Dock = 'Right'
+$listScrollBar.Width = 22
+$listScrollBar.BackColor = $script:Theme.Panel
+$listScrollBar.Visible = $false
+$listRowsPanel.Controls.Add($listScrollBar)
+$script:ListScrollBar = $listScrollBar
+
+$listScrollTrack = New-Object PakRatWheelPanel
+$listScrollTrack.Dock = 'Fill'
+$listScrollTrack.BackColor = $script:Theme.Header
+$listScrollBar.Controls.Add($listScrollTrack)
+$script:ListScrollTrack = $listScrollTrack
+
+$listScrollThumb = New-Object PakRatWheelPanel
+$listScrollThumb.Left = 3
+$listScrollThumb.Top = 0
+$listScrollThumb.Width = 16
+$listScrollThumb.Height = 48
+$listScrollThumb.BackColor = $script:Theme.Border
+$listScrollTrack.Controls.Add($listScrollThumb)
+$script:ListScrollThumb = $listScrollThumb
+
 $listView = New-Object System.Windows.Forms.ListView
 $listView.Dock = 'Fill'
 $listView.View = 'Details'
@@ -3407,21 +4947,23 @@ $listView.MultiSelect = $true
 $listView.GridLines = $false
 $listView.HideSelection = $false
 $listView.AllowDrop = $true
-[void]$listView.Columns.Add('In', 40)
-[void]$listView.Columns.Add('Name', 260)
-[void]$listView.Columns.Add('Path', 480)
+[void]$listView.Columns.Add('Name', 300)
+[void]$listView.Columns.Add('Path', 520)
 [void]$listView.Columns.Add('Size', 120)
 [void]$listView.Columns.Add('Type', 150)
-$mainPanel.Controls.Add($listView)
+$listRowsPanel.Controls.Add($listView)
+$listScrollBar.BringToFront()
 $script:ListView = $listView
 
 $listHeaderPanel = New-Object System.Windows.Forms.Panel
 $listHeaderPanel.Dock = 'Top'
 $listHeaderPanel.Height = 24
 $mainPanel.Controls.Add($listHeaderPanel)
+$mainPanel.Controls.SetChildIndex($listBodyPanel, 0)
+$mainPanel.Controls.SetChildIndex($listHeaderPanel, 1)
 $script:ListHeaderPanel = $listHeaderPanel
 
-$headerLabels = @('In', 'Name', 'Path', 'Size', 'Type')
+$headerLabels = @('Name', 'Path', 'Size', 'Type')
 $headerLeft = 0
 for ($i = 0; $i -lt $headerLabels.Count; $i++) {
     $headerBtn = New-Object System.Windows.Forms.Button
@@ -3535,6 +5077,13 @@ $statusLabel.TextAlign = 'MiddleLeft'
 $form.Controls.Add($statusStrip)
 $script:StatusLabel = $statusLabel
 
+$form.Controls.SetChildIndex($mainPanel, 0)
+$form.Controls.SetChildIndex($bottomPanel, 1)
+$form.Controls.SetChildIndex($statusStrip, 2)
+$form.Controls.SetChildIndex($menu, 3)
+$form.Controls.SetChildIndex($topPanel, 4)
+$form.Controls.SetChildIndex($scanSummaryPanel, 5)
+
 $addMenu = New-Object System.Windows.Forms.ContextMenuStrip
 $miAddFiles = New-Object System.Windows.Forms.ToolStripMenuItem('Add files...')
 $miAddFolder = New-Object System.Windows.Forms.ToolStripMenuItem('Add folder...')
@@ -3555,7 +5104,10 @@ $miManagePaths.Add_Click({ Show-ManageGamePathsDialog })
 $miAbout.Add_Click({ Show-About })
 
 $browseBtn.Add_Click({ Browse-BspFile })
-$browseGameBtn.Add_Click({ Browse-GameRoot })
+$browseGameBtn.Add_Click({
+    try { Browse-GameRoot }
+    catch { Show-ErrorDialog -Message $_.Exception.Message }
+})
 $loadBtn.Add_Click({ Load-BspFromUi })
 $saveBtnTop.Add_Click({ Save-BspInPlace })
 $saveAsBtnTop.Add_Click({ Save-BspAs })
@@ -3619,6 +5171,72 @@ $miAddFolder.Add_Click({ Add-FolderAction })
 
 $listView.Add_DoubleClick({ Show-EntryViewer })
 $treeView.Add_DoubleClick({ if ($treeView.SelectedNode -and $treeView.SelectedNode.Tag) { Show-EntryViewer } })
+
+$listView.Add_HandleCreated({
+    Hide-NativeListViewScrollBars -ListView $listView
+    Update-ListScrollBar
+})
+$listView.Add_SizeChanged({ Update-ListScrollBar })
+$listView.Add_MouseEnter({ [void]$listView.Focus() })
+$listView.Add_MouseWheel({
+    param($sender, $eventArgs)
+    Scroll-ListViewByWheelDelta -Delta $eventArgs.Delta
+    Set-MouseWheelHandled -EventArgs $eventArgs
+    try { [void]$listView.BeginInvoke([System.Windows.Forms.MethodInvoker]{ Update-ListScrollBar }) }
+    catch { Update-ListScrollBar }
+})
+$listView.Add_KeyUp({ Update-ListScrollBar })
+$listView.Add_SelectedIndexChanged({ Update-ListScrollBar })
+$listScrollTrack.Add_SizeChanged({ Update-ListScrollBar })
+foreach ($listScrollControl in @($listScrollBar, $listScrollTrack, $listScrollThumb)) {
+    $listScrollControl.TabStop = $true
+    $listScrollControl.Add_MouseEnter({ Set-WheelFocus -Control $this })
+    $listScrollControl.Add_MouseDown({ Set-WheelFocus -Control $this })
+    $listScrollControl.Add_MouseUp({ Set-WheelFocus -Control $this })
+    $listScrollControl.Add_MouseWheel({
+        param($sender, $eventArgs)
+        Set-WheelFocus -Control $sender
+        Scroll-ListViewByWheelDelta -Delta $eventArgs.Delta
+        Set-MouseWheelHandled -EventArgs $eventArgs
+    })
+}
+$listScrollTrack.Add_MouseDown({
+    if ($_.Button -ne [System.Windows.Forms.MouseButtons]::Left) { return }
+    Set-WheelFocus -Control $this
+    if ($listScrollThumb.Bounds.Contains($_.Location)) {
+        $script:ListScrollDragging = $true
+        $script:ListScrollDragOffsetY = $_.Y - $listScrollThumb.Top
+    } elseif ($_.Y -lt $listScrollThumb.Top) {
+        Scroll-ListViewByRows -Rows (-(Get-ListViewVisibleRowCount))
+    } else {
+        Scroll-ListViewByRows -Rows (Get-ListViewVisibleRowCount)
+    }
+})
+$listScrollTrack.Add_MouseMove({
+    if (-not $script:ListScrollDragging) { return }
+    Scroll-ListViewFromThumbY -ThumbY ($_.Y - $script:ListScrollDragOffsetY)
+})
+$listScrollTrack.Add_MouseUp({
+    $script:ListScrollDragging = $false
+    Set-WheelFocus -Control $this
+})
+$listScrollThumb.Add_MouseDown({
+    if ($_.Button -ne [System.Windows.Forms.MouseButtons]::Left) { return }
+    Set-WheelFocus -Control $this
+    $script:ListScrollDragging = $true
+    $script:ListScrollDragOffsetY = $_.Y
+})
+$listScrollThumb.Add_MouseMove({
+    if (-not $script:ListScrollDragging) { return }
+    $screenPoint = $listScrollThumb.PointToScreen($_.Location)
+    $trackPoint = $listScrollTrack.PointToClient($screenPoint)
+    Scroll-ListViewFromThumbY -ThumbY ($trackPoint.Y - $script:ListScrollDragOffsetY)
+})
+$listScrollThumb.Add_MouseUp({
+    $script:ListScrollDragging = $false
+    Set-WheelFocus -Control $this
+})
+$form.Add_MouseUp({ $script:ListScrollDragging = $false })
 
 $listView.Add_ColumnClick({
     $clicked = $_.Column
