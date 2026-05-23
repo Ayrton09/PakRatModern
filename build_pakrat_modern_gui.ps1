@@ -2,7 +2,7 @@
     [string]$InputFile = "$PSScriptRoot\\pakrat_modern_gui.ps1",
     [string]$OutputFile = "$PSScriptRoot\\PakRatModern.exe",
     [string]$IconFile = "$PSScriptRoot\\pakrat_modern.ico",
-    [string]$Version = '1.0.0.0'
+    [string]$Version = '1.1.0.0'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -20,7 +20,7 @@ $invokeParams = @{
     STA = $true
     title = 'PakRat Modern'
     product = 'PakRat Modern'
-    company = 'Ayrton'
+    company = 'Ayrton09'
     description = 'Modern Source BSP PAK editor inspired by PakRat'
     version = $Version
     configFile = $true

@@ -19,6 +19,7 @@ import argparse
 import fnmatch
 import io
 import os
+import re
 import struct
 import sys
 import zipfile
@@ -31,6 +32,12 @@ PAK_LUMP_INDEX = 40
 GAME_LUMP_INDEX = 35
 IDENT = b"VBSP"
 HEADER_SIZE = 4 + 4 + (LUMP_COUNT * 16) + 4
+MAX_BSP_BYTES = 1024 * 1024 * 1024
+MAX_PAK_ENTRY_BYTES = 512 * 1024 * 1024
+MAX_PAK_TOTAL_BYTES = 1536 * 1024 * 1024
+MAX_PAK_ENTRIES = 20000
+_UNSAFE_ARCHIVE_CHARS = re.compile(r'[\x00-\x1f<>:"|?*]')
+_RESERVED_WINDOWS_NAMES = re.compile(r"^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(\..*)?$", re.IGNORECASE)
 
 
 @dataclass
@@ -50,14 +57,19 @@ class BSPFile:
 
 
 def _norm_archive_path(path: str) -> str:
-    p = str(PurePosixPath(path.replace("\\", "/")))
-    while p.startswith("/"):
-        p = p[1:]
+    p = path.replace("\\", "/").strip()
+    if p.startswith("/"):
+        raise ValueError(f"Ruta absoluta invalida dentro del BSP: {path}")
     if p in {"", "."}:
         raise ValueError("Ruta dentro del BSP invalida")
-    if ".." in PurePosixPath(p).parts:
-        raise ValueError(f"Ruta invalida dentro del BSP: {path}")
-    return p
+    if _UNSAFE_ARCHIVE_CHARS.search(p):
+        raise ValueError(f"Caracteres invalidos en ruta dentro del BSP: {path}")
+    for part in p.split("/"):
+        if part in {"", ".", ".."} or part.endswith(".") or part.endswith(" "):
+            raise ValueError(f"Ruta invalida dentro del BSP: {path}")
+        if _RESERVED_WINDOWS_NAMES.match(part):
+            raise ValueError(f"Nombre reservado en ruta dentro del BSP: {path}")
+    return str(PurePosixPath(p))
 
 
 def _align4(value: int) -> int:
@@ -65,6 +77,9 @@ def _align4(value: int) -> int:
 
 
 def parse_bsp(path: Path) -> BSPFile:
+    size = path.stat().st_size
+    if size > MAX_BSP_BYTES:
+        raise ValueError(f"BSP demasiado grande ({size} bytes; limite {MAX_BSP_BYTES})")
     raw = path.read_bytes()
     if len(raw) < HEADER_SIZE:
         raise ValueError("Archivo demasiado pequeno para ser BSP Source")
@@ -117,19 +132,36 @@ def read_pak_entries(pak_bytes: bytes) -> Dict[str, Tuple[zipfile.ZipInfo, bytes
         return entries
 
     with zipfile.ZipFile(io.BytesIO(pak_bytes), "r") as zf:
-        for info in zf.infolist():
+        infos = zf.infolist()
+        if len(infos) > MAX_PAK_ENTRIES:
+            raise ValueError(f"PAK tiene demasiadas entradas ({len(infos)}; limite {MAX_PAK_ENTRIES})")
+        total = 0
+        for info in infos:
             if info.is_dir():
                 continue
             name = _norm_archive_path(info.filename)
+            if info.file_size > MAX_PAK_ENTRY_BYTES:
+                raise ValueError(f"Entrada PAK demasiado grande: {name} ({info.file_size} bytes)")
+            total += info.file_size
+            if total > MAX_PAK_TOTAL_BYTES:
+                raise ValueError(f"PAK demasiado grande descomprimido (limite {MAX_PAK_TOTAL_BYTES} bytes)")
             data = zf.read(info.filename)
             entries[name] = (info, data)
     return entries
 
 
 def write_pak_entries(entries: Dict[str, Tuple[zipfile.ZipInfo, bytes]]) -> bytes:
+    if len(entries) > MAX_PAK_ENTRIES:
+        raise ValueError(f"PAK tiene demasiadas entradas ({len(entries)}; limite {MAX_PAK_ENTRIES})")
+    total = 0
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, mode="w") as zf:
         for name, (info, data) in entries.items():
+            if len(data) > MAX_PAK_ENTRY_BYTES:
+                raise ValueError(f"Entrada PAK demasiado grande: {name} ({len(data)} bytes)")
+            total += len(data)
+            if total > MAX_PAK_TOTAL_BYTES:
+                raise ValueError(f"PAK demasiado grande descomprimido (limite {MAX_PAK_TOTAL_BYTES} bytes)")
             new_info = zipfile.ZipInfo(filename=name, date_time=info.date_time)
             new_info.comment = info.comment
             new_info.create_system = info.create_system
@@ -197,6 +229,9 @@ def update_pak_add(
             raise ValueError(f"{file_path} no esta dentro de --base {base}") from exc
 
         arcname = _norm_archive_path(str(rel))
+        size = file_path.stat().st_size
+        if size > MAX_PAK_ENTRY_BYTES:
+            raise ValueError(f"Archivo demasiado grande para PAK: {file_path} ({size} bytes)")
         data = file_path.read_bytes()
 
         now = (1980, 1, 1, 0, 0, 0)
@@ -234,6 +269,16 @@ def verify_pak(bsp: BSPFile) -> Tuple[bool, str]:
 
     try:
         with zipfile.ZipFile(io.BytesIO(pak_bytes), "r") as zf:
+            infos = zf.infolist()
+            if len(infos) > MAX_PAK_ENTRIES:
+                return False, f"PAK tiene demasiadas entradas ({len(infos)}; limite {MAX_PAK_ENTRIES})"
+            total = 0
+            for info in infos:
+                if info.file_size > MAX_PAK_ENTRY_BYTES:
+                    return False, f"Entrada PAK demasiado grande: {info.filename} ({info.file_size} bytes)"
+                total += info.file_size
+                if total > MAX_PAK_TOTAL_BYTES:
+                    return False, f"PAK demasiado grande descomprimido (limite {MAX_PAK_TOTAL_BYTES} bytes)"
             bad = zf.testzip()
             if bad:
                 return False, f"ZIP corrupto; primer archivo con error: {bad}"

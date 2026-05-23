@@ -14,9 +14,12 @@ function Get-AppBasePath {
     try {
         $exePath = [System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
         if (-not [string]::IsNullOrWhiteSpace($exePath)) {
-            $exeDir = [System.IO.Path]::GetDirectoryName($exePath)
-            if (-not [string]::IsNullOrWhiteSpace($exeDir) -and (Test-Path -LiteralPath $exeDir -PathType Container)) {
-                return $exeDir
+            $exeName = [System.IO.Path]::GetFileName($exePath)
+            if ($exeName -notin @('powershell.exe', 'pwsh.exe')) {
+                $exeDir = [System.IO.Path]::GetDirectoryName($exePath)
+                if (-not [string]::IsNullOrWhiteSpace($exeDir) -and (Test-Path -LiteralPath $exeDir -PathType Container)) {
+                    return $exeDir
+                }
             }
         }
     } catch { }
@@ -30,7 +33,7 @@ function Get-AppBasePath {
 
 $script:AppBasePath = Get-AppBasePath
 $script:StartupLogPath = Join-Path $script:AppBasePath 'PakRatModern-startup.log'
-$script:AppVersion = '1.0.0'
+$script:AppVersion = '1.1.0'
 
 function Write-StartupLog {
     param(
@@ -149,6 +152,271 @@ public class PakRatDarkRenderer : ToolStripProfessionalRenderer
 "@
 }
 
+if (-not ('PakRatDwm' -as [type])) {
+    Add-Type -ReferencedAssemblies @('System.dll') -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+
+public static class PakRatDwm
+{
+    [DllImport("dwmapi.dll")]
+    public static extern int DwmSetWindowAttribute(IntPtr hwnd, int attr, ref int attrValue, int attrSize);
+}
+"@
+}
+
+if (-not ('PakRatVpk' -as [type])) {
+    Add-Type -ReferencedAssemblies @('System.dll') -TypeDefinition @"
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Text;
+
+public static class PakRatVpk
+{
+    private const uint Signature = 0x55aa1234;
+
+    private sealed class NeedIndex
+    {
+        public readonly HashSet<string> All = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        public readonly Dictionary<string, HashSet<string>> DirectoriesByExtension = new Dictionary<string, HashSet<string>>(StringComparer.OrdinalIgnoreCase);
+    }
+
+    public static string[] FindNeededEntries(string dirVpkPath, string[] neededRefs)
+    {
+        var matches = new List<string>();
+        if (String.IsNullOrWhiteSpace(dirVpkPath) || neededRefs == null || neededRefs.Length == 0 || !File.Exists(dirVpkPath))
+        {
+            return matches.ToArray();
+        }
+
+        NeedIndex index = BuildNeedIndex(neededRefs);
+        if (index.All.Count == 0)
+        {
+            return matches.ToArray();
+        }
+
+        using (FileStream fs = File.OpenRead(dirVpkPath))
+        using (BinaryReader br = new BinaryReader(fs, Encoding.ASCII))
+        {
+            long limit = fs.Length;
+            if (fs.Length >= 12)
+            {
+                uint signature = br.ReadUInt32();
+                if (signature == Signature)
+                {
+                    uint version = br.ReadUInt32();
+                    uint treeSize = br.ReadUInt32();
+                    if (version == 2)
+                    {
+                        if (fs.Length < 28)
+                        {
+                            return matches.ToArray();
+                        }
+                        br.ReadUInt32();
+                        br.ReadUInt32();
+                        br.ReadUInt32();
+                        br.ReadUInt32();
+                    }
+                    else if (version != 1)
+                    {
+                        return matches.ToArray();
+                    }
+
+                    limit = Math.Min(fs.Length, fs.Position + (long)treeSize);
+                }
+                else
+                {
+                    fs.Position = 0;
+                }
+            }
+
+            while (fs.Position < limit)
+            {
+                string rawExtension = ReadCString(br, limit);
+                if (rawExtension.Length == 0)
+                {
+                    break;
+                }
+                string extension = NormalizeVpkPart(rawExtension);
+
+                bool extensionNeeded = index.DirectoriesByExtension.ContainsKey(extension);
+
+                while (fs.Position < limit)
+                {
+                    string rawDirectory = ReadCString(br, limit);
+                    if (rawDirectory.Length == 0)
+                    {
+                        break;
+                    }
+                    string directory = NormalizeVpkPart(rawDirectory);
+
+                    HashSet<string> neededDirectories = null;
+                    bool directoryNeeded = extensionNeeded &&
+                        index.DirectoriesByExtension.TryGetValue(extension, out neededDirectories) &&
+                        neededDirectories.Contains(directory);
+
+                    while (fs.Position < limit)
+                    {
+                        string rawFileName = ReadCString(br, limit);
+                        if (rawFileName.Length == 0)
+                        {
+                            break;
+                        }
+                        string fileName = NormalizeVpkPart(rawFileName);
+                        if ((limit - fs.Position) < 18)
+                        {
+                            return matches.ToArray();
+                        }
+
+                        br.ReadUInt32();
+                        ushort preloadBytes = br.ReadUInt16();
+                        br.ReadUInt16();
+                        br.ReadUInt32();
+                        br.ReadUInt32();
+                        ushort terminator = br.ReadUInt16();
+                        if (terminator != 0xffff)
+                        {
+                            return matches.ToArray();
+                        }
+
+                        if (directoryNeeded)
+                        {
+                            string path = ComposePath(extension, directory, fileName);
+                            if (path.Length > 0 && index.All.Contains(path))
+                            {
+                                matches.Add(path);
+                                if (matches.Count >= index.All.Count)
+                                {
+                                    return matches.ToArray();
+                                }
+                            }
+                        }
+
+                        if (preloadBytes > 0)
+                        {
+                            long next = fs.Position + preloadBytes;
+                            if (next > limit)
+                            {
+                                return matches.ToArray();
+                            }
+                            fs.Position = next;
+                        }
+                    }
+                }
+            }
+        }
+
+        return matches.ToArray();
+    }
+
+    private static NeedIndex BuildNeedIndex(string[] neededRefs)
+    {
+        var index = new NeedIndex();
+        foreach (string raw in neededRefs)
+        {
+            string normalized = NormalizeArchivePath(raw);
+            if (normalized.Length == 0 || !index.All.Add(normalized))
+            {
+                continue;
+            }
+
+            string extension;
+            string directory;
+            SplitPath(normalized, out extension, out directory);
+
+            HashSet<string> dirs;
+            if (!index.DirectoriesByExtension.TryGetValue(extension, out dirs))
+            {
+                dirs = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                index.DirectoriesByExtension.Add(extension, dirs);
+            }
+            dirs.Add(directory);
+        }
+        return index;
+    }
+
+    private static string ReadCString(BinaryReader br, long limit)
+    {
+        var bytes = new List<byte>(64);
+        while (br.BaseStream.Position < limit)
+        {
+            byte b = br.ReadByte();
+            if (b == 0)
+            {
+                break;
+            }
+            bytes.Add(b);
+        }
+        if (bytes.Count == 0)
+        {
+            return String.Empty;
+        }
+        return Encoding.ASCII.GetString(bytes.ToArray());
+    }
+
+    private static string NormalizeVpkPart(string value)
+    {
+        if (String.IsNullOrWhiteSpace(value) || value == " ")
+        {
+            return String.Empty;
+        }
+        return value.Replace('\\', '/').Trim('/');
+    }
+
+    private static string ComposePath(string extension, string directory, string fileName)
+    {
+        if (String.IsNullOrWhiteSpace(fileName))
+        {
+            return String.Empty;
+        }
+
+        string leaf = String.IsNullOrWhiteSpace(extension) ? fileName : fileName + "." + extension;
+        string path = String.IsNullOrWhiteSpace(directory) ? leaf : directory + "/" + leaf;
+        return NormalizeArchivePath(path);
+    }
+
+    private static void SplitPath(string path, out string extension, out string directory)
+    {
+        int slash = path.LastIndexOf('/');
+        int dot = path.LastIndexOf('.');
+        extension = (dot > slash) ? path.Substring(dot + 1) : String.Empty;
+        directory = (slash >= 0) ? path.Substring(0, slash) : String.Empty;
+    }
+
+    private static string NormalizeArchivePath(string path)
+    {
+        if (String.IsNullOrWhiteSpace(path))
+        {
+            return String.Empty;
+        }
+
+        string p = path.Replace('\\', '/').Trim().Trim('/');
+        if (p.Length == 0 || p.IndexOf(':') >= 0)
+        {
+            return String.Empty;
+        }
+
+        string[] parts = p.Split('/');
+        for (int i = 0; i < parts.Length; i++)
+        {
+            string part = parts[i];
+            if (String.IsNullOrWhiteSpace(part) || part == "." || part == ".." || part.EndsWith(".") || part.EndsWith(" "))
+            {
+                return String.Empty;
+            }
+            if (part.IndexOfAny(Path.GetInvalidFileNameChars()) >= 0)
+            {
+                return String.Empty;
+            }
+        }
+
+        return p;
+    }
+}
+"@
+}
+
 $LumpCount = 64
 $PakLumpIndex = 40
 $GameLumpIndex = 35
@@ -156,6 +424,10 @@ $EntitiesLumpIndex = 0
 $TexDataStringDataLumpIndex = 43
 $TexDataStringTableLumpIndex = 44
 $HeaderSize = 4 + 4 + ($LumpCount * 16) + 4
+$MaxBspBytes = [int64](1024MB)
+$MaxPakEntryBytes = [int64](512MB)
+$MaxPakTotalBytes = [int64](1536MB)
+$MaxPakEntries = 20000
 
 $script:SettingsPath = Join-Path $script:AppBasePath 'pakrat_modern_gui.settings.json'
 $script:MainForm = $null
@@ -210,6 +482,14 @@ $script:State = [ordered]@{
     ScanNotFound = 0
     ScanAlreadyInPak = 0
 }
+$script:BaseVpkCache = [ordered]@{
+    GameRoot = ''
+    NeededKey = ''
+    Matches = $null
+}
+$script:VmtDependencyCache = @{}
+$script:ScanInProgress = $false
+$script:LastUiPump = [DateTime]::MinValue
 
 function Show-ErrorDialog {
     param([string]$Message)
@@ -232,6 +512,28 @@ function Update-Status {
     if ($script:StatusLabel) {
         $script:StatusLabel.Text = $Message
     }
+}
+
+function Pump-UiMessages {
+    param([int]$MinMilliseconds = 200)
+    if (-not $script:MainForm) { return }
+
+    $now = [DateTime]::UtcNow
+    if (($now - $script:LastUiPump).TotalMilliseconds -lt $MinMilliseconds) { return }
+    $script:LastUiPump = $now
+    try { [System.Windows.Forms.Application]::DoEvents() } catch { }
+}
+
+function Set-ScanBusy {
+    param([bool]$Busy, [string]$Message = '')
+    $script:ScanInProgress = $Busy
+    if (-not [string]::IsNullOrWhiteSpace($Message)) { Update-Status $Message }
+    if ($script:MainForm) {
+        $script:MainForm.UseWaitCursor = $Busy
+        [System.Windows.Forms.Cursor]::Current = if ($Busy) { [System.Windows.Forms.Cursors]::WaitCursor } else { [System.Windows.Forms.Cursors]::Default }
+        $script:MainForm.Refresh()
+    }
+    Pump-UiMessages -MinMilliseconds 0
 }
 
 function Set-ScanSummary {
@@ -404,6 +706,18 @@ function Apply-DarkThemeToContextMenu {
             $item.ForeColor = $script:Theme.Text
         }
     }
+}
+
+function Enable-DarkTitleBar {
+    param([System.Windows.Forms.Form]$Form)
+    if ($null -eq $Form) { return }
+
+    try {
+        $enabled = 1
+        foreach ($attribute in @(20, 19)) {
+            [void][PakRatDwm]::DwmSetWindowAttribute($Form.Handle, $attribute, [ref]$enabled, 4)
+        }
+    } catch { }
 }
 
 function Enable-DarkListViewRendering {
@@ -625,16 +939,320 @@ function Copy-ByteRange {
     return $dest
 }
 
+function Assert-FileSizeLimit {
+    param(
+        [string]$Path,
+        [int64]$MaxBytes,
+        [string]$Label
+    )
+
+    $info = Get-Item -LiteralPath $Path -ErrorAction Stop
+    if ($info.Length -gt $MaxBytes) {
+        throw "$Label is too large: $($info.Length) bytes. Limit: $MaxBytes bytes."
+    }
+    return [int64]$info.Length
+}
+
 function Normalize-ArchivePath {
     param([string]$PathValue)
     if ([string]::IsNullOrWhiteSpace($PathValue)) { throw 'Invalid internal path.' }
     $p = $PathValue.Replace('\\', '/').Trim()
-    while ($p.StartsWith('/')) { $p = $p.Substring(1) }
+    if ($p.StartsWith('/')) { throw "Unsafe absolute internal path: $PathValue" }
     if ([string]::IsNullOrWhiteSpace($p) -or $p -eq '.') { throw 'Invalid internal path.' }
+    if ($p -match '[\x00-\x1F<>:"|?*]') { throw "Unsafe internal path characters: $PathValue" }
     foreach ($part in $p.Split('/')) {
-        if ($part -eq '..') { throw "Unsafe internal path: $PathValue" }
+        if ([string]::IsNullOrWhiteSpace($part) -or $part -eq '.' -or $part -eq '..') { throw "Unsafe internal path: $PathValue" }
+        if ($part.EndsWith('.') -or $part.EndsWith(' ')) { throw "Unsafe internal path segment: $PathValue" }
+        if ($part -match '^(?i)(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(\..*)?$') { throw "Unsafe reserved internal path segment: $PathValue" }
     }
     return $p
+}
+
+function Read-VpkCString {
+    param([System.IO.BinaryReader]$Reader, [long]$Limit)
+
+    $bytes = New-Object System.Collections.Generic.List[byte]
+    while ($Reader.BaseStream.Position -lt $Limit) {
+        $b = $Reader.ReadByte()
+        if ($b -eq 0) { break }
+        $bytes.Add([byte]$b)
+    }
+
+    if ($bytes.Count -eq 0) { return '' }
+    return [System.Text.Encoding]::ASCII.GetString($bytes.ToArray())
+}
+
+function ConvertTo-VpkArchivePath {
+    param([string]$Extension, [string]$Directory, [string]$FileName)
+
+    if ($Extension -eq ' ') { $Extension = '' }
+    if ($Directory -eq ' ') { $Directory = '' }
+    if ($FileName -eq ' ') { $FileName = '' }
+    if ([string]::IsNullOrWhiteSpace($FileName)) { return $null }
+
+    $leaf = if ([string]::IsNullOrWhiteSpace($Extension)) { $FileName } else { "${FileName}.${Extension}" }
+    $path = if ([string]::IsNullOrWhiteSpace($Directory)) { $leaf } else { "$Directory/$leaf" }
+
+    try {
+        return Normalize-ArchivePath -PathValue $path
+    } catch {
+        return $null
+    }
+}
+
+function Add-VpkDirectoryEntries {
+    param(
+        [string]$DirVpkPath,
+        [System.Collections.Generic.HashSet[string]]$Entries,
+        [System.Collections.Generic.HashSet[string]]$NeededRefs = $null,
+        [string[]]$NeededRefArray = $null
+    )
+
+    if (-not [System.IO.File]::Exists($DirVpkPath)) { return }
+
+    if ($null -ne $NeededRefs -and ('PakRatVpk' -as [type])) {
+        try {
+            if ($null -eq $NeededRefArray) {
+                $NeededRefArray = [string[]]@($NeededRefs | ForEach-Object { [string]$_ })
+            }
+            foreach ($match in [PakRatVpk]::FindNeededEntries($DirVpkPath, $NeededRefArray)) {
+                if (-not [string]::IsNullOrWhiteSpace($match)) { [void]$Entries.Add($match) }
+            }
+            return
+        } catch {
+            # Fall back to the PowerShell parser below if the compiled helper is unavailable.
+        }
+    }
+
+    $fs = $null
+    $br = $null
+    try {
+        $fs = [System.IO.File]::OpenRead($DirVpkPath)
+        $br = New-Object System.IO.BinaryReader($fs)
+        $limit = $fs.Length
+
+        if ($fs.Length -ge 12) {
+            $signature = $br.ReadUInt32()
+            if ($signature -eq 0x55aa1234) {
+                $version = $br.ReadUInt32()
+                $treeSize = [uint32]$br.ReadUInt32()
+                if ($version -eq 2) {
+                    if ($fs.Length -lt 28) { return }
+                    [void]$br.ReadUInt32()
+                    [void]$br.ReadUInt32()
+                    [void]$br.ReadUInt32()
+                    [void]$br.ReadUInt32()
+                } elseif ($version -ne 1) {
+                    return
+                }
+                $limit = [Math]::Min($fs.Length, ($fs.Position + [int64]$treeSize))
+            } else {
+                $fs.Position = 0
+            }
+        }
+
+        while ($fs.Position -lt $limit) {
+            $extension = Read-VpkCString -Reader $br -Limit $limit
+            if ([string]::IsNullOrEmpty($extension)) { break }
+
+            while ($fs.Position -lt $limit) {
+                $directory = Read-VpkCString -Reader $br -Limit $limit
+                if ([string]::IsNullOrEmpty($directory)) { break }
+
+                while ($fs.Position -lt $limit) {
+                    Pump-UiMessages
+                    $fileName = Read-VpkCString -Reader $br -Limit $limit
+                    if ([string]::IsNullOrEmpty($fileName)) { break }
+                    if (($limit - $fs.Position) -lt 18) { return }
+
+                    [void]$br.ReadUInt32()
+                    $preloadBytes = $br.ReadUInt16()
+                    [void]$br.ReadUInt16()
+                    [void]$br.ReadUInt32()
+                    [void]$br.ReadUInt32()
+                    $terminator = $br.ReadUInt16()
+                    if ($terminator -ne 0xffff) { return }
+
+                    $archivePath = ConvertTo-VpkArchivePath -Extension $extension -Directory $directory -FileName $fileName
+                    if ($null -ne $archivePath -and ($null -eq $NeededRefs -or $NeededRefs.Contains($archivePath))) {
+                        [void]$Entries.Add($archivePath)
+                        if ($null -ne $NeededRefs -and $Entries.Count -ge $NeededRefs.Count) { return }
+                    }
+
+                    if ($preloadBytes -gt 0) {
+                        $next = $fs.Position + [int64]$preloadBytes
+                        if ($next -gt $limit) { return }
+                        $fs.Position = $next
+                    }
+                }
+            }
+        }
+    } catch {
+        return
+    } finally {
+        if ($br) { $br.Dispose() }
+        elseif ($fs) { $fs.Dispose() }
+    }
+}
+
+function Add-BaseVpkCandidateFile {
+    param(
+        [System.Collections.Generic.HashSet[string]]$Files,
+        [string]$Path
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Path)) { return }
+
+    $candidate = $Path
+    if ($candidate -notmatch '(?i)_dir\.vpk$' -and $candidate -match '(?i)\.vpk$') {
+        $candidate = [System.IO.Path]::Combine(
+            [System.IO.Path]::GetDirectoryName($candidate),
+            ([System.IO.Path]::GetFileNameWithoutExtension($candidate) + '_dir.vpk')
+        )
+    }
+
+    if ([System.IO.File]::Exists($candidate)) {
+        [void]$Files.Add([System.IO.Path]::GetFullPath($candidate))
+    }
+}
+
+function Add-BaseVpkFilesFromFolder {
+    param(
+        [System.Collections.Generic.HashSet[string]]$Files,
+        [string]$Folder
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Folder) -or -not [System.IO.Directory]::Exists($Folder)) { return }
+    foreach ($vpk in (Get-ChildItem -LiteralPath $Folder -Filter '*_dir.vpk' -File -ErrorAction SilentlyContinue)) {
+        [void]$Files.Add($vpk.FullName)
+    }
+}
+
+function Get-GameInfoSearchPathValues {
+    param([string]$GameRoot)
+
+    $values = New-Object System.Collections.Generic.List[string]
+    $gameInfo = Join-Path $GameRoot 'gameinfo.txt'
+    if (-not (Test-Path -LiteralPath $gameInfo -PathType Leaf)) { return @() }
+
+    $inSearchPaths = $false
+    $braceDepth = 0
+    $seenOpenBrace = $false
+
+    foreach ($raw in [System.IO.File]::ReadAllLines($gameInfo)) {
+        $line = ([regex]::Replace($raw, '//.*$', '')).Trim()
+        if ([string]::IsNullOrWhiteSpace($line)) { continue }
+
+        if (-not $inSearchPaths) {
+            if ($line -match '^(?i)"?SearchPaths"?\b') { $inSearchPaths = $true }
+            else { continue }
+        }
+
+        $openCount = [regex]::Matches($line, '\{').Count
+        $closeCount = [regex]::Matches($line, '\}').Count
+        if ($openCount -gt 0) { $seenOpenBrace = $true }
+        $braceDepth += $openCount
+
+        $body = ($line -replace '[{}]', ' ').Trim()
+        if ($seenOpenBrace -and -not [string]::IsNullOrWhiteSpace($body) -and $body -notmatch '^(?i)"?SearchPaths"?$') {
+            $tokens = New-Object System.Collections.Generic.List[string]
+            foreach ($m in [regex]::Matches($body, '"([^"]*)"|([^\s{}]+)')) {
+                $token = if ($m.Groups[1].Success) { $m.Groups[1].Value } else { $m.Groups[2].Value }
+                if (-not [string]::IsNullOrWhiteSpace($token)) { $tokens.Add($token) }
+            }
+            if ($tokens.Count -ge 2) { $values.Add($tokens[$tokens.Count - 1]) }
+        }
+
+        $braceDepth -= $closeCount
+        if ($seenOpenBrace -and $braceDepth -le 0) { break }
+    }
+
+    return @($values.ToArray())
+}
+
+function Resolve-GameInfoSearchPath {
+    param([string]$GameRoot, [string]$SearchPath)
+
+    if ([string]::IsNullOrWhiteSpace($SearchPath)) { return $null }
+    $value = $SearchPath.Trim().Trim('"').Replace('\\', '/')
+    if ([string]::IsNullOrWhiteSpace($value) -or $value.Contains('*')) { return $null }
+    if ($value -eq 'GAME') { return $GameRoot }
+
+    $sourceRoot = [System.IO.Path]::GetDirectoryName($GameRoot)
+    if ([string]::IsNullOrWhiteSpace($sourceRoot)) { $sourceRoot = $GameRoot }
+
+    if ($value -match '^(?i)\|gameinfo_path\|') {
+        $suffix = $value.Substring('|gameinfo_path|'.Length).TrimStart('/', '\')
+        if ([string]::IsNullOrWhiteSpace($suffix) -or $suffix -eq '.') { return $GameRoot }
+        return [System.IO.Path]::GetFullPath((Join-Path $GameRoot $suffix))
+    }
+
+    if ($value -match '^(?i)\|all_source_engine_paths\|') {
+        $suffix = $value.Substring('|all_source_engine_paths|'.Length).TrimStart('/', '\')
+        if ([string]::IsNullOrWhiteSpace($suffix) -or $suffix -eq '.') { return $sourceRoot }
+        return [System.IO.Path]::GetFullPath((Join-Path $sourceRoot $suffix))
+    }
+
+    if ([System.IO.Path]::IsPathRooted($value)) { return [System.IO.Path]::GetFullPath($value) }
+    return [System.IO.Path]::GetFullPath((Join-Path $sourceRoot $value))
+}
+
+function Get-ArchivePathSetKey {
+    param([System.Collections.Generic.HashSet[string]]$Set)
+    if ($null -eq $Set -or $Set.Count -eq 0) { return '' }
+    return (($Set | Sort-Object | ForEach-Object { $_.ToLowerInvariant() }) -join "`n")
+}
+
+function Get-BaseVpkEntries {
+    param(
+        [string]$GameRoot,
+        [System.Collections.Generic.HashSet[string]]$NeededRefs = $null
+    )
+
+    $norm = Normalize-FolderPath -PathValue $GameRoot
+    $entries = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+    if ($null -eq $norm) { return $entries }
+    $neededKey = Get-ArchivePathSetKey -Set $NeededRefs
+    $neededArray = if ($null -ne $NeededRefs) { [string[]]@($NeededRefs | ForEach-Object { [string]$_ }) } else { $null }
+
+    if (($null -ne $script:BaseVpkCache.Matches) -and
+        $script:BaseVpkCache.GameRoot.Equals($norm, [System.StringComparison]::OrdinalIgnoreCase) -and
+        $script:BaseVpkCache.NeededKey.Equals($neededKey, [System.StringComparison]::Ordinal)) {
+        return $script:BaseVpkCache.Matches
+    }
+
+    $vpkFiles = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+    Add-BaseVpkFilesFromFolder -Files $vpkFiles -Folder $norm
+
+    foreach ($searchPath in (Get-GameInfoSearchPathValues -GameRoot $norm)) {
+        $resolved = Resolve-GameInfoSearchPath -GameRoot $norm -SearchPath $searchPath
+        if ($null -eq $resolved) { continue }
+        if ([System.IO.Directory]::Exists($resolved)) {
+            Add-BaseVpkFilesFromFolder -Files $vpkFiles -Folder $resolved
+        } else {
+            Add-BaseVpkCandidateFile -Files $vpkFiles -Path $resolved
+        }
+    }
+
+    foreach ($vpk in ($vpkFiles | Sort-Object)) {
+        Add-VpkDirectoryEntries -DirVpkPath $vpk -Entries $entries -NeededRefs $NeededRefs -NeededRefArray $neededArray
+        if ($null -ne $NeededRefs -and $entries.Count -ge $NeededRefs.Count) { break }
+    }
+
+    $script:BaseVpkCache.GameRoot = $norm
+    $script:BaseVpkCache.NeededKey = $neededKey
+    $script:BaseVpkCache.Matches = $entries
+    return $entries
+}
+
+function Test-BaseGameArchivePath {
+    param(
+        [System.Collections.Generic.HashSet[string]]$BaseVpkEntries,
+        [string]$ArchivePath
+    )
+
+    if ($null -eq $BaseVpkEntries -or [string]::IsNullOrWhiteSpace($ArchivePath)) { return $false }
+    return $BaseVpkEntries.Contains($ArchivePath)
 }
 
 function To-OsPath { param([string]$ArchivePath) return $ArchivePath.Replace('/', [System.IO.Path]::DirectorySeparatorChar) }
@@ -763,6 +1381,7 @@ function Serialize-Header {
 
 function Parse-Bsp {
     param([string]$Path)
+    [void](Assert-FileSizeLimit -Path $Path -MaxBytes $MaxBspBytes -Label 'BSP')
     $raw = [System.IO.File]::ReadAllBytes($Path)
     if ($raw.Length -lt $HeaderSize) { throw 'File is too small for a Source BSP.' }
     $ident = [System.Text.Encoding]::ASCII.GetString($raw, 0, 4)
@@ -810,9 +1429,14 @@ function Read-PakEntries {
     try {
         $zip = New-Object System.IO.Compression.ZipArchive($ms, [System.IO.Compression.ZipArchiveMode]::Read, $false)
         try {
+            if ($zip.Entries.Count -gt $MaxPakEntries) { throw "PAK has too many entries: $($zip.Entries.Count). Limit: $MaxPakEntries." }
+            $totalUncompressed = 0L
             foreach ($entry in $zip.Entries) {
                 if ($entry.FullName.EndsWith('/')) { continue }
                 $name = Normalize-ArchivePath -PathValue $entry.FullName
+                if ($entry.Length -gt $MaxPakEntryBytes) { throw "PAK entry is too large: $name ($($entry.Length) bytes). Limit: $MaxPakEntryBytes bytes." }
+                $totalUncompressed += [int64]$entry.Length
+                if ($totalUncompressed -gt $MaxPakTotalBytes) { throw "PAK uncompressed total is too large. Limit: $MaxPakTotalBytes bytes." }
                 $stream = $entry.Open()
                 try {
                     $tmp = New-Object System.IO.MemoryStream
@@ -824,7 +1448,7 @@ function Read-PakEntries {
             }
         } finally { $zip.Dispose() }
     } catch {
-        throw "PAK lump is not a valid ZIP: $($_.Exception.Message)"
+        throw "PAK lump could not be read safely: $($_.Exception.Message)"
     } finally { $ms.Dispose() }
 
     return $entries
@@ -832,6 +1456,9 @@ function Read-PakEntries {
 
 function Write-PakEntries {
     param([System.Collections.IDictionary]$Entries)
+    if ($Entries.Count -gt $MaxPakEntries) { throw "PAK has too many entries: $($Entries.Count). Limit: $MaxPakEntries." }
+    $totalUncompressed = 0L
+
     $ms = New-Object System.IO.MemoryStream
     try {
         $zip = New-Object System.IO.Compression.ZipArchive($ms, [System.IO.Compression.ZipArchiveMode]::Create, $true)
@@ -842,6 +1469,9 @@ function Write-PakEntries {
                 $zstream = $zentry.Open()
                 try {
                     $bytes = [byte[]]$rec.Data
+                    if ($bytes.Length -gt $MaxPakEntryBytes) { throw "PAK entry is too large: $k ($($bytes.Length) bytes). Limit: $MaxPakEntryBytes bytes." }
+                    $totalUncompressed += [int64]$bytes.Length
+                    if ($totalUncompressed -gt $MaxPakTotalBytes) { throw "PAK uncompressed total is too large. Limit: $MaxPakTotalBytes bytes." }
                     if ($bytes.Length -gt 0) { $zstream.Write($bytes, 0, $bytes.Length) }
                 } finally { $zstream.Dispose() }
             }
@@ -1028,7 +1658,7 @@ function Refresh-TreeView {
                 }
             }
         }
-        $script:TreeView.ExpandAll()
+        if (@($script:State.Entries.Keys).Count -le 1000) { $script:TreeView.ExpandAll() }
     } finally {
         $script:TreeView.EndUpdate()
     }
@@ -1036,9 +1666,12 @@ function Refresh-TreeView {
 
 function Refresh-AllViews {
     if (-not $script:ListView -or -not $script:TreeView) { return }
-    Refresh-ListView
-    Refresh-TreeView
-    Refresh-ListHeaderUI
+    if ($script:State.ViewAsTree) {
+        Refresh-TreeView
+    } else {
+        Refresh-ListView
+        Refresh-ListHeaderUI
+    }
 
     $count = @($script:State.Entries.Keys).Count
     $total = 0L
@@ -1054,6 +1687,13 @@ function Set-ViewMode {
     $script:TreeView.Visible = $AsTree
     $script:ListView.Visible = -not $AsTree
     if ($script:ListHeaderPanel) { $script:ListHeaderPanel.Visible = -not $AsTree }
+    if ($script:State.Entries.Count -gt 0) {
+        if ($AsTree) { Refresh-TreeView }
+        else {
+            Refresh-ListView
+            Refresh-ListHeaderUI
+        }
+    }
 }
 
 function Get-SelectedKeys {
@@ -1213,6 +1853,7 @@ function Add-FilesWithBase {
         $arc = Resolve-ArchivePathFromFile -FilePath $f -BasePath $BasePath -UseGameRootFixup:$UseGameRootFixup
         if ($null -eq $arc) { $skipped++; continue }
 
+        [void](Assert-FileSizeLimit -Path $f -MaxBytes $MaxPakEntryBytes -Label $arc)
         $bytes = [System.IO.File]::ReadAllBytes($f)
         $kind = Add-OrReplaceEntry -ArchivePath $arc -Data $bytes
         if ($kind -eq 'Added') { $added++ } else { $replaced++ }
@@ -1482,13 +2123,11 @@ function Add-ModelWithCompanions {
     $mdl = Normalize-GameRef -Value $ModelPath
     if ($null -eq $mdl) { return }
     [void]$Set.Add($mdl)
-    $base = [System.IO.Path]::ChangeExtension($mdl, $null)
-    [void]$Set.Add("$base.vvd")
-    [void]$Set.Add("$base.phy")
-    [void]$Set.Add("$base.vtx")
-    [void]$Set.Add("$base.dx80.vtx")
-    [void]$Set.Add("$base.dx90.vtx")
-    [void]$Set.Add("$base.sw.vtx")
+    $base = ([System.IO.Path]::ChangeExtension($mdl, $null)).TrimEnd('.')
+    if ([string]::IsNullOrWhiteSpace($base)) { return }
+    foreach ($suffix in @('.vvd', '.phy', '.dx80.vtx', '.dx90.vtx', '.sw.vtx')) {
+        [void]$Set.Add("${base}${suffix}")
+    }
 }
 
 function Read-NullTerminatedString {
@@ -1509,7 +2148,10 @@ function Collect-BspReferences {
     if ($entitiesBytes.Length -gt 0) {
         $entityText = [System.Text.Encoding]::ASCII.GetString($entitiesBytes).Replace([char]0, "`n")
         $pairs = [regex]::Matches($entityText, '"([^"]*)"\s*"([^"]*)"')
+        $pairIndex = 0
         foreach ($m in $pairs) {
+            if (($pairIndex % 256) -eq 0) { Pump-UiMessages }
+            $pairIndex++
             $key = $m.Groups[1].Value.ToLowerInvariant().Trim()
             $val = $m.Groups[2].Value.Trim()
             if ([string]::IsNullOrWhiteSpace($val)) { continue }
@@ -1546,6 +2188,7 @@ function Collect-BspReferences {
     $strTable = Get-LumpBytes -Raw $Raw -Lumps $Lumps -Index $TexDataStringTableLumpIndex
     if ($strData.Length -gt 0 -and $strTable.Length -gt 0) {
         for ($i = 0; $i -le ($strTable.Length - 4); $i += 4) {
+            if ((($i / 4) % 256) -eq 0) { Pump-UiMessages }
             $off = [BitConverter]::ToInt32($strTable, $i)
             if ($off -lt 0 -or $off -ge $strData.Length) { continue }
             $mat = Read-NullTerminatedString -Bytes $strData -Offset $off
@@ -1563,59 +2206,105 @@ function Collect-BspReferences {
         Add-RefToSet -Set $set -Ref ("resource/overviews/${MapName}_radar.dds")
         Add-RefToSet -Set $set -Ref ("materials/overviews/$MapName.vmt")
         Add-RefToSet -Set $set -Ref ("materials/overviews/$MapName.vtf")
+        Add-RefToSet -Set $set -Ref ("materials/overviews/${MapName}_radar.vmt")
+        Add-RefToSet -Set $set -Ref ("materials/overviews/${MapName}_radar.vtf")
     }
 
     return $set
 }
+
+function Add-VmtDependencyRef {
+    param(
+        [System.Collections.Generic.List[string]]$Refs,
+        [string]$Value,
+        [string]$Extension
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Value)) { return }
+    $candidate = $Value.Trim()
+    if ($candidate -notmatch ([regex]::Escape($Extension) + '$')) { $candidate += $Extension }
+    $ref = Normalize-GameRef -Value $candidate
+    if ($null -eq $ref) { return }
+    if ($ref -notmatch '^(?i)materials/') { $ref = "materials/$ref" }
+    [void]$Refs.Add($ref)
+}
+
+function Get-RegexFirstValue {
+    param([System.Text.RegularExpressions.Match]$Match, [int[]]$GroupIndexes)
+    foreach ($index in $GroupIndexes) {
+        if ($Match.Groups[$index].Success) { return $Match.Groups[$index].Value }
+    }
+    return ''
+}
+
+function Get-VmtDependencyRefs {
+    param([string]$Path)
+
+    if ([string]::IsNullOrWhiteSpace($Path)) { return @() }
+
+    try {
+        $info = New-Object System.IO.FileInfo($Path)
+        if (-not $info.Exists) { return @() }
+    } catch {
+        return @()
+    }
+
+    $fullPath = $info.FullName
+    if ($script:VmtDependencyCache.ContainsKey($fullPath)) {
+        $cached = $script:VmtDependencyCache[$fullPath]
+        if ($cached.Length -eq $info.Length -and $cached.LastWriteUtcTicks -eq $info.LastWriteTimeUtc.Ticks) {
+            return @($cached.Refs)
+        }
+    }
+
+    try { $content = [System.IO.File]::ReadAllText($fullPath) }
+    catch { return @() }
+
+    $refs = New-Object System.Collections.Generic.List[string]
+
+    $includes = [regex]::Matches($content, '(?im)^\s*"?include"?\s+(?:"([^"]+)"|([^\s{}]+))')
+    foreach ($m in $includes) {
+        Add-VmtDependencyRef -Refs $refs -Value (Get-RegexFirstValue -Match $m -GroupIndexes @(1, 2)) -Extension '.vmt'
+    }
+
+    $tex = [regex]::Matches($content, '(?im)^\s*"?\$([A-Za-z0-9_]+)"?\s+(?:"([^"]+)"|([^\s{}]+))')
+    foreach ($m in $tex) {
+        $key = $m.Groups[1].Value.ToLowerInvariant()
+        $value = Get-RegexFirstValue -Match $m -GroupIndexes @(2, 3)
+        if ($key -match 'texture|bump|normal|envmapmask|detail|selfillum|flowmap|dudv|lightwarp|phongexponent|iris') {
+            Add-VmtDependencyRef -Refs $refs -Value $value -Extension '.vtf'
+        } elseif ($key -eq 'bottommaterial') {
+            Add-VmtDependencyRef -Refs $refs -Value $value -Extension '.vmt'
+        }
+    }
+
+    $result = [string[]]$refs.ToArray()
+    $script:VmtDependencyCache[$fullPath] = [pscustomobject]@{
+        Length = [int64]$info.Length
+        LastWriteUtcTicks = [int64]$info.LastWriteTimeUtc.Ticks
+        Refs = $result
+    }
+    return @($result)
+}
+
 function Expand-VmtDependencies {
     param([System.Collections.Generic.HashSet[string]]$Set, [string]$GameRoot)
-    if ([string]::IsNullOrWhiteSpace($GameRoot) -or -not (Test-Path $GameRoot -PathType Container)) { return }
+    if ([string]::IsNullOrWhiteSpace($GameRoot) -or -not [System.IO.Directory]::Exists($GameRoot)) { return }
 
     $queue = New-Object 'System.Collections.Generic.Queue[string]'
     $visited = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
     foreach ($ref in $Set) { if ([System.IO.Path]::GetExtension($ref).ToLowerInvariant() -eq '.vmt') { $queue.Enqueue($ref) } }
 
     while ($queue.Count -gt 0) {
+        Pump-UiMessages
         $vmtRef = $queue.Dequeue()
         if (-not $visited.Add($vmtRef)) { continue }
 
         $vmtPath = Join-Path $GameRoot (To-OsPath $vmtRef)
-        if (-not (Test-Path $vmtPath -PathType Leaf)) { continue }
-
-        try { $content = [System.IO.File]::ReadAllText($vmtPath) }
-        catch { continue }
-
-        $includes = [regex]::Matches($content, '(?im)^\s*include\s+"([^"]+)"')
-        foreach ($m in $includes) {
-            $inc = $m.Groups[1].Value
-            if ($inc -notmatch '\.vmt$') { $inc += '.vmt' }
-            $incRef = Normalize-GameRef -Value $inc
-            if ($null -ne $incRef) {
-                if ($incRef -notmatch '^(?i)materials/') { $incRef = "materials/$incRef" }
-                if ($Set.Add($incRef)) { $queue.Enqueue($incRef) }
-            }
-        }
-
-        $tex = [regex]::Matches($content, '(?im)^\s*"\$([A-Za-z0-9_]+)"\s+"([^"]+)"')
-        foreach ($m in $tex) {
-            $k = $m.Groups[1].Value.ToLowerInvariant()
-            $v = $m.Groups[2].Value
-            if ([string]::IsNullOrWhiteSpace($v)) { continue }
-
-            if ($k -match 'texture|bump|normal|envmapmask|detail|selfillum|flowmap|dudv|lightwarp|phongexponent|iris') {
-                if ($v -notmatch '\.vtf$') { $v += '.vtf' }
-                $ref = Normalize-GameRef -Value $v
-                if ($null -ne $ref) {
-                    if ($ref -notmatch '^(?i)materials/') { $ref = "materials/$ref" }
-                    [void]$Set.Add($ref)
-                }
-            } elseif ($k -eq 'bottommaterial') {
-                if ($v -notmatch '\.vmt$') { $v += '.vmt' }
-                $ref = Normalize-GameRef -Value $v
-                if ($null -ne $ref) {
-                    if ($ref -notmatch '^(?i)materials/') { $ref = "materials/$ref" }
-                    if ($Set.Add($ref)) { $queue.Enqueue($ref) }
-                }
+        foreach ($depRef in (Get-VmtDependencyRefs -Path $vmtPath)) {
+            if ([string]::IsNullOrWhiteSpace($depRef)) { continue }
+            if ($Set.Add($depRef) -and [System.IO.Path]::GetExtension($depRef).ToLowerInvariant() -eq '.vmt') {
+                $queue.Enqueue($depRef)
             }
         }
     }
@@ -1646,18 +2335,36 @@ function Invoke-Scan {
     if ($null -eq $gameRoot) { return $null }
 
     $mapName = if ($script:State.CurrentBspPath) { [System.IO.Path]::GetFileNameWithoutExtension($script:State.CurrentBspPath) } else { '' }
+    Update-Status 'Scan: reading BSP references...'
+    Pump-UiMessages -MinMilliseconds 0
     $refs = Collect-BspReferences -Raw $script:State.BspRaw -Lumps $script:State.Lumps -MapName $mapName -IncludeExtras:$script:State.IncludeExtrasInScan
+    Update-Status 'Scan: expanding material dependencies...'
+    Pump-UiMessages -MinMilliseconds 0
     Expand-VmtDependencies -Set $refs -GameRoot $gameRoot
+    Update-Status 'Scan: checking base game VPKs...'
+    Pump-UiMessages -MinMilliseconds 0
+    $baseVpkEntries = Get-BaseVpkEntries -GameRoot $gameRoot -NeededRefs $refs
 
-    $rows = @()
+    Update-Status 'Scan: checking disk files...'
+    Pump-UiMessages -MinMilliseconds 0
+    $rows = New-Object System.Collections.Generic.List[object]
+    $diskExistsCache = @{}
     foreach ($r in ($refs | Sort-Object)) {
+        Pump-UiMessages
         $inPak = $script:State.Entries.Contains($r)
         $full = Join-Path $gameRoot (To-OsPath $r)
-        $exists = Test-Path -LiteralPath $full -PathType Leaf
-        $status = if ($inPak) { 'Already in PAK' } elseif ($exists) { 'Can add' } else { 'Missing on disk' }
-        $rows += [pscustomobject]@{ Path = $r; Exists = $exists; InPak = $inPak; Status = $status; FullDiskPath = $full }
+        if ($diskExistsCache.ContainsKey($full)) {
+            $exists = [bool]$diskExistsCache[$full]
+        } else {
+            $exists = [System.IO.File]::Exists($full)
+            $diskExistsCache[$full] = $exists
+        }
+        $baseGame = (-not $inPak) -and (Test-BaseGameArchivePath -BaseVpkEntries $baseVpkEntries -ArchivePath $r)
+        $addable = (-not $inPak) -and (-not $baseGame) -and $exists
+        $status = if ($inPak) { 'Already in PAK' } elseif ($baseGame) { 'Base game VPK' } elseif ($exists) { 'Can add' } else { 'Missing on disk' }
+        [void]$rows.Add([pscustomobject]@{ Path = $r; Exists = $exists; InPak = $inPak; BaseGame = $baseGame; Addable = $addable; Status = $status; FullDiskPath = $full })
     }
-    return $rows
+    return @($rows.ToArray())
 }
 
 function Update-ScanSummaryFromResults {
@@ -1669,12 +2376,22 @@ function Update-ScanSummaryFromResults {
         return
     }
 
-    $alreadyInPak = @($Results | Where-Object { $_.InPak }).Count
-    $missingInPak = @($Results | Where-Object { -not $_.InPak })
-    $canAdd = @($missingInPak | Where-Object { $_.Exists }).Count
-    $notFound = @($missingInPak | Where-Object { -not $_.Exists }).Count
+    $alreadyInPak = 0
+    $missingTotal = 0
+    $canAdd = 0
+    $notFound = 0
+    foreach ($row in $Results) {
+        if ($row.InPak) {
+            $alreadyInPak++
+            continue
+        }
+        if ($row.BaseGame) { continue }
+        $missingTotal++
+        if ($row.Addable) { $canAdd++ }
+        elseif (-not $row.Exists) { $notFound++ }
+    }
 
-    Set-ScanSummary -MissingTotal $missingInPak.Count -CanAdd $canAdd -NotFound $notFound -AlreadyInPak $alreadyInPak
+    Set-ScanSummary -MissingTotal $missingTotal -CanAdd $canAdd -NotFound $notFound -AlreadyInPak $alreadyInPak
     Refresh-ScanSummaryUI
 }
 
@@ -1686,13 +2403,21 @@ function Add-ScanResults {
     $missingOnDisk = 0
     $readErrors = 0
     $alreadyInPak = 0
+    $baseGameSkipped = 0
 
     foreach ($row in $ScanResults) {
+        Pump-UiMessages
         if ($row.InPak) { $alreadyInPak++; continue }
+        if ($row.BaseGame) { $baseGameSkipped++; continue }
+        if (-not $row.Addable) {
+            if (-not $row.Exists) { $missingOnDisk++ }
+            continue
+        }
         if (-not $row.Exists) { $missingOnDisk++; continue }
-        if (-not (Test-Path -LiteralPath $row.FullDiskPath -PathType Leaf)) { $missingOnDisk++; continue }
+        if (-not [System.IO.File]::Exists($row.FullDiskPath)) { $missingOnDisk++; continue }
 
         try {
+            [void](Assert-FileSizeLimit -Path $row.FullDiskPath -MaxBytes $MaxPakEntryBytes -Label $row.Path)
             $bytes = [System.IO.File]::ReadAllBytes($row.FullDiskPath)
             $res = Add-OrReplaceEntry -ArchivePath $row.Path -Data $bytes
             if ($res -eq 'Added') { $added++ } else { $replaced++ }
@@ -1706,7 +2431,7 @@ function Add-ScanResults {
         Refresh-AllViews
     }
 
-    $status = "Add all: +$added new | $replaced replaced | missing $missingOnDisk | errors $readErrors"
+    $status = "Add all: +$added new | $replaced replaced | missing $missingOnDisk | base game $baseGameSkipped | errors $readErrors"
     Update-Status $status
 
     return [pscustomobject]@{
@@ -1715,6 +2440,7 @@ function Add-ScanResults {
         MissingOnDisk = $missingOnDisk
         ReadErrors = $readErrors
         AlreadyInPak = $alreadyInPak
+        BaseGameSkipped = $baseGameSkipped
         Summary = $status
     }
 }
@@ -1784,16 +2510,16 @@ function Show-ScanDialog {
         try {
             $lv.Items.Clear()
             foreach ($r in $Results) {
-                if ($onlyCanAddChk.Checked -and -not $r.Exists) { continue }
+                if ($onlyCanAddChk.Checked -and -not $r.Addable) { continue }
 
-                $statusText = if ($r.Exists) { 'Can add' } else { 'Not found' }
+                $statusText = $r.Status
                 $it = New-Object System.Windows.Forms.ListViewItem($r.Path)
                 [void]$it.SubItems.Add($statusText)
                 $inPakText = if ($r.InPak) { 'Yes' } else { 'No' }
                 $existsText = if ($r.Exists) { 'Yes' } else { 'No' }
                 [void]$it.SubItems.Add($inPakText)
                 [void]$it.SubItems.Add($existsText)
-                if ($r.Exists) { $it.ForeColor = $script:Theme.Success }
+                if ($r.Addable) { $it.ForeColor = $script:Theme.Success }
                 else { $it.ForeColor = $script:Theme.Error }
                 [void]$lv.Items.Add($it)
             }
@@ -1808,7 +2534,7 @@ function Show-ScanDialog {
     $onlyCanAddChk.Add_CheckedChanged({ & $refreshList })
     $exportBtn.Add_Click({
         try {
-            $rows = if ($onlyCanAddChk.Checked) { @($Results | Where-Object { $_.Exists }) } else { @($Results) }
+            $rows = if ($onlyCanAddChk.Checked) { @($Results | Where-Object { $_.Addable }) } else { @($Results) }
             if ($rows.Count -eq 0) {
                 Show-InfoDialog -Message 'There are no rows to export.'
                 return
@@ -1832,7 +2558,7 @@ function Show-ScanDialog {
             $lines = New-Object System.Collections.Generic.List[string]
             $lines.Add("Path`tStatus`tIn PAK`tOn disk")
             foreach ($r in $rows) {
-                $statusText = if ($r.Exists) { 'Can add' } else { 'Not found' }
+                $statusText = $r.Status
                 $inPakText = if ($r.InPak) { 'Yes' } else { 'No' }
                 $existsText = if ($r.Exists) { 'Yes' } else { 'No' }
                 $lines.Add(("{0}`t{1}`t{2}`t{3}" -f $r.Path, $statusText, $inPakText, $existsText))
@@ -1855,27 +2581,53 @@ function Show-ScanDialog {
 }
 
 function Run-Scan {
+    if ($script:ScanInProgress) { Update-Status 'Scan already running...'; return }
+    $scanBusy = $false
     try {
+        Set-ScanBusy -Busy:$true -Message 'Scan: starting...'
+        $scanBusy = $true
         $results = Invoke-Scan
+        Set-ScanBusy -Busy:$false
+        $scanBusy = $false
         if ($null -eq $results) { return }
         Update-ScanSummaryFromResults -Results $results
         if ($results.Count -eq 0) { Show-InfoDialog -Message 'No references were found in the map.'; return }
 
-        $missingInPak = @($results | Where-Object { -not $_.InPak })
+        $baseGameSkipped = 0
+        $canAdd = 0
+        $missingOnDisk = 0
+        $missingRows = New-Object System.Collections.Generic.List[object]
+        foreach ($row in $results) {
+            if ($row.InPak) { continue }
+            if ($row.BaseGame) {
+                $baseGameSkipped++
+                continue
+            }
+            [void]$missingRows.Add($row)
+            if ($row.Addable) { $canAdd++ }
+            elseif (-not $row.Exists) { $missingOnDisk++ }
+        }
+        $missingInPak = @($missingRows.ToArray())
         if ($missingInPak.Count -eq 0) {
             Show-InfoDialog -Message 'No files are missing from the BSP. It is already complete.'
-            Update-Status 'Scan: no missing files.'
+            Update-Status "Scan: no missing files | base game skipped $baseGameSkipped"
             return
         }
 
-        $canAdd = @($missingInPak | Where-Object { $_.Exists }).Count
-        $missingOnDisk = @($missingInPak | Where-Object { -not $_.Exists }).Count
-        Update-Status "Scan: missing in BSP $($missingInPak.Count) | can add $canAdd | not found $missingOnDisk"
+        Update-Status "Scan: missing in BSP $($missingInPak.Count) | can add $canAdd | not found $missingOnDisk | base game skipped $baseGameSkipped"
 
         $scanAction = Show-ScanDialog -Results $missingInPak
         if ($scanAction -eq 'add' -or $scanAction -eq 'add_save') {
+            Set-ScanBusy -Busy:$true -Message 'Adding scan results...'
+            $scanBusy = $true
             $addResult = Add-ScanResults -ScanResults $missingInPak
+            Set-ScanBusy -Busy:$false
+            $scanBusy = $false
+            Set-ScanBusy -Busy:$true -Message 'Refreshing scan summary...'
+            $scanBusy = $true
             $updatedResults = Invoke-Scan
+            Set-ScanBusy -Busy:$false
+            $scanBusy = $false
             if ($null -ne $updatedResults) { Update-ScanSummaryFromResults -Results $updatedResults }
 
             if ($scanAction -eq 'add_save') {
@@ -1888,25 +2640,48 @@ function Run-Scan {
         }
     } catch {
         Show-ErrorDialog -Message $_.Exception.Message
+    } finally {
+        if ($scanBusy) { Set-ScanBusy -Busy:$false }
     }
 }
 
 function Run-AutoAdd {
+    if ($script:ScanInProgress) { Update-Status 'Scan already running...'; return }
+    $scanBusy = $false
     try {
+        Set-ScanBusy -Busy:$true -Message 'Scan: starting...'
+        $scanBusy = $true
         $results = Invoke-Scan
+        Set-ScanBusy -Busy:$false
+        $scanBusy = $false
         if ($null -eq $results) { return }
         Update-ScanSummaryFromResults -Results $results
 
-        $missingInPak = @($results | Where-Object { -not $_.InPak })
-        $addable = @($missingInPak | Where-Object { $_.Exists })
+        $addableRows = New-Object System.Collections.Generic.List[object]
+        foreach ($row in $results) {
+            if (-not $row.InPak -and -not $row.BaseGame -and $row.Addable) {
+                [void]$addableRows.Add($row)
+            }
+        }
+        $addable = @($addableRows.ToArray())
         if ($addable.Count -eq 0) { Show-InfoDialog -Message 'There are no addable missing files in this BSP.'; return }
         if (-not (Confirm-Dialog -Message "Add $($addable.Count) missing files to the PAK now?")) { return }
 
+        Set-ScanBusy -Busy:$true -Message 'Adding scan results...'
+        $scanBusy = $true
         [void](Add-ScanResults -ScanResults $addable)
+        Set-ScanBusy -Busy:$false
+        $scanBusy = $false
+        Set-ScanBusy -Busy:$true -Message 'Refreshing scan summary...'
+        $scanBusy = $true
         $updatedResults = Invoke-Scan
+        Set-ScanBusy -Busy:$false
+        $scanBusy = $false
         if ($null -ne $updatedResults) { Update-ScanSummaryFromResults -Results $updatedResults }
     } catch {
         Show-ErrorDialog -Message $_.Exception.Message
+    } finally {
+        if ($scanBusy) { Set-ScanBusy -Busy:$false }
     }
 }
 
@@ -2223,7 +2998,7 @@ function Show-PreferencesDialog {
     $chkExtras.Left = 100
     $chkExtras.Top = 88
     $chkExtras.Width = 460
-    $chkExtras.Text = 'Include optional extras in scan (nav, overviews, map txt, radar dds)'
+    $chkExtras.Text = 'Include optional extras in scan (nav, overviews, map txt, radar files)'
     $chkExtras.Checked = $script:State.IncludeExtrasInScan
     $dlg.Controls.Add($chkExtras)
 
@@ -2277,13 +3052,12 @@ function Show-About {
     $msg = @(
         'PakRat Modern'
         "Version $($script:AppVersion)"
-        'Author: Ayrton'
+        'Author: Ayrton09'
         ''
         'Updated replacement for the classic PakRat workflow:'
         '- View/Edit/Add/Delete/Extract PAK files'
         '- Scan and auto-add from map references'
         '- Safer save and automatic backup'
-        '- Dark UI with modern release packaging'
     ) -join "`r`n"
     Show-InfoDialog -Message $msg
 }
@@ -2294,6 +3068,7 @@ $form.Width = 1140
 $form.Height = 760
 $form.MinimumSize = New-Object System.Drawing.Size(980, 620)
 $form.Font = New-Object System.Drawing.Font('Segoe UI', 9)
+$form.Add_HandleCreated({ Enable-DarkTitleBar -Form $form })
 if (Test-Path -LiteralPath $script:AppIconPath -PathType Leaf) {
     try { $form.Icon = New-Object System.Drawing.Icon($script:AppIconPath) }
     catch {
@@ -2754,6 +3529,7 @@ try {
     Apply-DarkThemeRecursive -Control $form
     Apply-DarkThemeToToolStrips -MenuStrip $menu -StatusStrip $statusStrip
     Apply-DarkThemeToContextMenu -Menu $addMenu
+    Enable-DarkTitleBar -Form $form
     Set-ViewMode -AsTree:$false
     Set-WindowTitle
     Update-Status 'Load a BSP to start.'
@@ -2785,4 +3561,3 @@ try {
     } catch { }
     throw
 }
-

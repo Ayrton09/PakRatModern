@@ -12,20 +12,60 @@ function Convert-ToWslPath {
         return "/mnt/$drive$tail"
     }
 
-    return $Value
+    return ($Value -replace '\\', '/')
+}
+
+function Test-Python3Candidate {
+    param(
+        [string]$Command,
+        [string[]]$PrefixArgs = @()
+    )
+
+    if (-not (Get-Command $Command -ErrorAction SilentlyContinue)) { return $false }
+
+    try {
+        & $Command @PrefixArgs -c "import sys; raise SystemExit(0 if sys.version_info[0] >= 3 else 1)" > $null 2> $null
+        return ($LASTEXITCODE -eq 0)
+    } catch {
+        return $false
+    }
 }
 
 if (-not $Rest -or $Rest.Count -eq 0) {
-    Write-Host "Uso: .\\pakrat_modern.ps1 <comando> [args]"
-    Write-Host "Ejemplo: .\\pakrat_modern.ps1 list C:\\maps\\test.bsp"
+    Write-Host "Uso: .\pakrat_modern.ps1 <comando> [args]"
+    Write-Host "Ejemplo: .\pakrat_modern.ps1 list C:\maps\test.bsp"
     exit 1
 }
 
-$scriptPath = '/mnt/c/Users/Ayrton/Documents/New project 7/pakrat_modern.py'
-$converted = @()
-foreach ($arg in $Rest) {
-    $converted += Convert-ToWslPath -Value $arg
+$scriptPath = Join-Path $PSScriptRoot 'pakrat_modern.py'
+if (-not (Test-Path -LiteralPath $scriptPath -PathType Leaf)) {
+    Write-Error "No se encontro pakrat_modern.py junto a este wrapper: $scriptPath"
+    exit 1
 }
 
-& wsl.exe python3 $scriptPath @converted
-exit $LASTEXITCODE
+$candidates = @(
+    @{ Command = 'py'; Args = @('-3') },
+    @{ Command = 'python3'; Args = @() },
+    @{ Command = 'python'; Args = @() }
+)
+
+foreach ($candidate in $candidates) {
+    $command = [string]$candidate.Command
+    $prefixArgs = [string[]]$candidate.Args
+    if (Test-Python3Candidate -Command $command -PrefixArgs $prefixArgs) {
+        & $command @prefixArgs $scriptPath @Rest
+        exit $LASTEXITCODE
+    }
+}
+
+if (Get-Command wsl.exe -ErrorAction SilentlyContinue) {
+    $converted = New-Object System.Collections.Generic.List[string]
+    foreach ($arg in $Rest) {
+        [void]$converted.Add((Convert-ToWslPath -Value $arg))
+    }
+    & wsl.exe --cd (Convert-ToWslPath -Value $PSScriptRoot) python3 (Convert-ToWslPath -Value $scriptPath) @($converted.ToArray())
+    exit $LASTEXITCODE
+}
+
+Write-Error 'No se encontro Python 3 local ni WSL con python3. Instala Python 3 o ejecuta la GUI.'
+exit 1

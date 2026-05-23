@@ -44,6 +44,7 @@ Main GUI features:
 - Extract selected entries
 - PAK verification
 - Scan map references from BSP data
+- Skip files that are already shipped in the selected game's base VPKs and `gameinfo.txt` search paths
 - Auto-add addable missing files
 - Scan summary bar: missing, addable, not found, already in PAK
 - Export scan results to `.txt`
@@ -60,6 +61,8 @@ Optional extras currently checked by scan:
 - `resource/overviews/<mapname>_radar.dds`
 - `materials/overviews/<mapname>.vmt`
 - `materials/overviews/<mapname>.vtf`
+- `materials/overviews/<mapname>_radar.vmt`
+- `materials/overviews/<mapname>_radar.vtf`
 
 ## CLI
 
@@ -68,6 +71,8 @@ Main CLI script:
 
 PowerShell wrapper:
 - [pakrat_modern.ps1](pakrat_modern.ps1)
+
+The wrapper uses local Python 3 when available and falls back to WSL `python3`.
 
 Examples:
 
@@ -107,5 +112,7 @@ Release package:
 - Updates `PAKFILE` and adjusted lump offsets only
 - Blocks unsafe PAK resize if `LUMP_GAME_LUMP` is after the PAK lump
 - Prevents unsafe extraction paths like `../`
+- Blocks unsafe Windows path characters in internal PAK paths
+- Applies size and entry-count limits while reading packed ZIP data
 - Supports validation before saving
 - Supports optional `.bak` backup for in-place save
