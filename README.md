@@ -7,7 +7,7 @@ Modern PakRat-style tool for editing the `PAKFILE` lump inside Source `.bsp` map
 It includes:
 - Native Windows GUI
 - CLI for scripting and automation
-- Built `.exe` launcher for everyday use
+- Built `.exe` launcher
 
 ## GUI
 

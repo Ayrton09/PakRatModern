@@ -491,20 +491,95 @@ $script:VmtDependencyCache = @{}
 $script:ScanInProgress = $false
 $script:LastUiPump = [DateTime]::MinValue
 
+function Show-DarkDialog {
+    param(
+        [System.Windows.Forms.Form]$Dialog,
+        [System.Windows.Forms.IWin32Window]$Owner = $script:MainForm
+    )
+
+    if ($null -eq $Dialog) { return [System.Windows.Forms.DialogResult]::None }
+    $Dialog.ShowInTaskbar = $false
+    $Dialog.Add_HandleCreated({ Enable-DarkTitleBar -Form $Dialog })
+    Apply-DarkThemeRecursive -Control $Dialog
+    Enable-DarkTitleBar -Form $Dialog
+    if ($Owner) { return $Dialog.ShowDialog($Owner) }
+    return $Dialog.ShowDialog()
+}
+
+function Show-DarkMessageDialog {
+    param(
+        [string]$Message,
+        [string]$Title = 'PakRat Modern',
+        [string[]]$Buttons = @('OK'),
+        [string]$DefaultButton = 'OK'
+    )
+
+    $dlg = New-Object System.Windows.Forms.Form
+    $dlg.Text = $Title
+    $dlg.StartPosition = 'CenterParent'
+    $dlg.Width = 520
+    $dlg.Height = 190
+    $dlg.MinimumSize = New-Object System.Drawing.Size(420, 170)
+    $dlg.FormBorderStyle = 'FixedDialog'
+    $dlg.MaximizeBox = $false
+    $dlg.MinimizeBox = $false
+
+    $text = New-Object System.Windows.Forms.Label
+    $text.Left = 18
+    $text.Top = 18
+    $text.Width = 470
+    $text.Height = 78
+    $text.AutoEllipsis = $true
+    $text.Text = $Message
+    $dlg.Controls.Add($text)
+
+    $panel = New-Object System.Windows.Forms.Panel
+    $panel.Dock = 'Bottom'
+    $panel.Height = 56
+    $dlg.Controls.Add($panel)
+
+    $buttonWidth = 92
+    $gap = 10
+    $totalWidth = ($Buttons.Count * $buttonWidth) + ([Math]::Max(0, $Buttons.Count - 1) * $gap)
+    $left = [Math]::Max(12, $dlg.ClientSize.Width - $totalWidth - 18)
+
+    foreach ($buttonText in $Buttons) {
+        $btn = New-Object System.Windows.Forms.Button
+        $btn.Text = $buttonText
+        $btn.Width = $buttonWidth
+        $btn.Height = 28
+        $btn.Left = $left
+        $btn.Top = 14
+        $btn.Tag = $buttonText
+        $btn.Add_Click({
+            $dlg.Tag = [string]$this.Tag
+            $dlg.Close()
+        })
+        $panel.Controls.Add($btn)
+        if ($buttonText -eq $DefaultButton) { $dlg.AcceptButton = $btn }
+        if ($buttonText -eq 'Cancel' -or $buttonText -eq 'No') { $dlg.CancelButton = $btn }
+        $left += $buttonWidth + $gap
+    }
+
+    [void](Show-DarkDialog -Dialog $dlg)
+    if ([string]::IsNullOrWhiteSpace([string]$dlg.Tag)) { return 'Cancel' }
+    return [string]$dlg.Tag
+}
+
 function Show-ErrorDialog {
     param([string]$Message)
-    [System.Windows.Forms.MessageBox]::Show($Message, 'PakRat Modern', [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error) | Out-Null
+    [void](Show-DarkMessageDialog -Message $Message -Buttons @('OK') -DefaultButton 'OK')
 }
 
 function Show-InfoDialog {
     param([string]$Message)
-    [System.Windows.Forms.MessageBox]::Show($Message, 'PakRat Modern', [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Information) | Out-Null
+    [void](Show-DarkMessageDialog -Message $Message -Buttons @('OK') -DefaultButton 'OK')
 }
 
 function Confirm-Dialog {
     param([string]$Message)
-    $result = [System.Windows.Forms.MessageBox]::Show($Message, 'PakRat Modern', [System.Windows.Forms.MessageBoxButtons]::YesNo, [System.Windows.Forms.MessageBoxIcon]::Question)
-    return $result -eq [System.Windows.Forms.DialogResult]::Yes
+    $result = Show-DarkMessageDialog -Message $Message -Buttons @('Yes', 'No') -DefaultButton 'No'
+    return $result -eq 'Yes'
 }
 
 function Update-Status {
@@ -578,6 +653,57 @@ function Set-ControlDoubleBuffered {
     } catch { }
 }
 
+function Enable-DarkListBoxRendering {
+    param([System.Windows.Forms.ListBox]$ListBox)
+    if ($null -eq $ListBox) { return }
+    if ($ListBox.DrawMode -eq [System.Windows.Forms.DrawMode]::OwnerDrawFixed) { return }
+    $ListBox.DrawMode = [System.Windows.Forms.DrawMode]::OwnerDrawFixed
+    if ($ListBox.ItemHeight -lt 18) { $ListBox.ItemHeight = 18 }
+    $ListBox.Add_DrawItem({
+        param($sender, $e)
+        if ($e.Index -lt 0) { return }
+        $selected = (($e.State -band [System.Windows.Forms.DrawItemState]::Selected) -ne 0)
+        $back = if ($selected) { $script:Theme.Selection } else { $script:Theme.Input }
+        $fore = if ($selected) { $script:Theme.AccentText } else { $script:Theme.Text }
+        $backBrush = New-Object System.Drawing.SolidBrush($back)
+        $foreBrush = New-Object System.Drawing.SolidBrush($fore)
+        try {
+            $e.Graphics.FillRectangle($backBrush, $e.Bounds)
+            $text = [string]$sender.Items[$e.Index]
+            $rect = New-Object System.Drawing.RectangleF(($e.Bounds.X + 4), ($e.Bounds.Y + 1), ($e.Bounds.Width - 8), ($e.Bounds.Height - 2))
+            $e.Graphics.DrawString($text, $sender.Font, $foreBrush, $rect)
+        } finally {
+            $backBrush.Dispose()
+            $foreBrush.Dispose()
+        }
+    })
+}
+
+function Enable-DarkComboBoxRendering {
+    param([System.Windows.Forms.ComboBox]$ComboBox)
+    if ($null -eq $ComboBox) { return }
+    if ($ComboBox.DrawMode -eq [System.Windows.Forms.DrawMode]::OwnerDrawFixed) { return }
+    $ComboBox.DrawMode = [System.Windows.Forms.DrawMode]::OwnerDrawFixed
+    $ComboBox.Add_DrawItem({
+        param($sender, $e)
+        if ($e.Index -lt 0) { return }
+        $selected = (($e.State -band [System.Windows.Forms.DrawItemState]::Selected) -ne 0)
+        $back = if ($selected) { $script:Theme.Selection } else { $script:Theme.Input }
+        $fore = if ($selected) { $script:Theme.AccentText } else { $script:Theme.Text }
+        $backBrush = New-Object System.Drawing.SolidBrush($back)
+        $foreBrush = New-Object System.Drawing.SolidBrush($fore)
+        try {
+            $e.Graphics.FillRectangle($backBrush, $e.Bounds)
+            $text = [string]$sender.Items[$e.Index]
+            $rect = New-Object System.Drawing.RectangleF(($e.Bounds.X + 4), ($e.Bounds.Y + 1), ($e.Bounds.Width - 8), ($e.Bounds.Height - 2))
+            $e.Graphics.DrawString($text, $sender.Font, $foreBrush, $rect)
+        } finally {
+            $backBrush.Dispose()
+            $foreBrush.Dispose()
+        }
+    })
+}
+
 function Apply-DarkThemeRecursive {
     param([System.Windows.Forms.Control]$Control)
 
@@ -602,10 +728,13 @@ function Apply-DarkThemeRecursive {
         $Control.BackColor = $script:Theme.Input
         $Control.ForeColor = $script:Theme.Text
         $Control.FlatStyle = 'Flat'
+        Enable-DarkComboBoxRendering -ComboBox $Control
     }
     elseif ($Control -is [System.Windows.Forms.ListBox]) {
         $Control.BackColor = $script:Theme.Input
         $Control.ForeColor = $script:Theme.Text
+        $Control.BorderStyle = 'FixedSingle'
+        Enable-DarkListBoxRendering -ListBox $Control
     }
     elseif ($Control -is [System.Windows.Forms.ListView]) {
         Set-ControlDoubleBuffered -Control $Control
@@ -620,6 +749,7 @@ function Apply-DarkThemeRecursive {
         $Control.BorderStyle = 'None'
     }
     elseif ($Control -is [System.Windows.Forms.Button]) {
+        $Control.UseVisualStyleBackColor = $false
         $Control.BackColor = $script:Theme.Panel
         $Control.ForeColor = $script:Theme.Text
         $Control.FlatStyle = 'Flat'
@@ -627,7 +757,13 @@ function Apply-DarkThemeRecursive {
         $Control.FlatAppearance.MouseDownBackColor = $script:Theme.Selection
         $Control.FlatAppearance.MouseOverBackColor = $script:Theme.Header
     }
-    elseif ($Control -is [System.Windows.Forms.CheckBox] -or $Control -is [System.Windows.Forms.Label]) {
+    elseif ($Control -is [System.Windows.Forms.CheckBox]) {
+        $Control.UseVisualStyleBackColor = $false
+        $Control.BackColor = [System.Drawing.Color]::Transparent
+        $Control.ForeColor = $script:Theme.Text
+        $Control.FlatStyle = 'Flat'
+    }
+    elseif ($Control -is [System.Windows.Forms.Label]) {
         $Control.BackColor = [System.Drawing.Color]::Transparent
         $Control.ForeColor = $script:Theme.Text
     }
@@ -1957,8 +2093,7 @@ function Show-EntryViewer {
     $txt.Text = $content
     $dlg.Controls.Add($txt)
 
-    Apply-DarkThemeRecursive -Control $dlg
-    [void]$dlg.ShowDialog($script:MainForm)
+    [void](Show-DarkDialog -Dialog $dlg)
 }
 function Edit-SelectedEntry {
     Ensure-BspLoaded
@@ -2025,8 +2160,7 @@ function Edit-SelectedEntry {
     $dlg.AcceptButton = $ok
     $dlg.CancelButton = $cancel
 
-    Apply-DarkThemeRecursive -Control $dlg
-    if ($dlg.ShowDialog($script:MainForm) -ne [System.Windows.Forms.DialogResult]::OK) { return }
+    if ((Show-DarkDialog -Dialog $dlg) -ne [System.Windows.Forms.DialogResult]::OK) { return }
 
     $newName = $txtName.Text.Trim()
     if ([string]::IsNullOrWhiteSpace($newName)) { Show-ErrorDialog -Message 'Name cannot be empty.'; return }
@@ -2575,8 +2709,7 @@ function Show-ScanDialog {
     & $refreshList
 
     Enable-DarkListViewRendering -ListView $lv -UseOwnerDraw:$false
-    Apply-DarkThemeRecursive -Control $dlg
-    [void]$dlg.ShowDialog($script:MainForm)
+    [void](Show-DarkDialog -Dialog $dlg)
     return [string]$dlg.Tag
 }
 
@@ -2837,8 +2970,7 @@ function Show-ManageGamePathsDialog {
 
     $closeBtn.Add_Click({ $dlg.Close() })
 
-    Apply-DarkThemeRecursive -Control $dlg
-    [void]$dlg.ShowDialog($script:MainForm)
+    [void](Show-DarkDialog -Dialog $dlg)
 }
 
 function Load-BspFromUi {
@@ -3032,8 +3164,7 @@ function Show-PreferencesDialog {
         if ($fd.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { $txtRoot.Text = $fd.SelectedPath }
     })
 
-    Apply-DarkThemeRecursive -Control $dlg
-    if ($dlg.ShowDialog($script:MainForm) -ne [System.Windows.Forms.DialogResult]::OK) { return }
+    if ((Show-DarkDialog -Dialog $dlg) -ne [System.Windows.Forms.DialogResult]::OK) { return }
 
     if (-not [string]::IsNullOrWhiteSpace($txtRoot.Text.Trim())) {
         if (-not (Set-CurrentGameRoot -PathValue $txtRoot.Text.Trim() -Persist:$false)) {
@@ -3511,8 +3642,7 @@ $treeView.Add_DragDrop({ $paths = [string[]]$_.Data.GetData([System.Windows.Form
 
 $form.Add_FormClosing({
     if ($script:State.IsDirty) {
-        $res = [System.Windows.Forms.MessageBox]::Show('There are unsaved changes. Exit anyway?', 'PakRat Modern', [System.Windows.Forms.MessageBoxButtons]::YesNo, [System.Windows.Forms.MessageBoxIcon]::Warning)
-        if ($res -ne [System.Windows.Forms.DialogResult]::Yes) { $_.Cancel = $true }
+        if (-not (Confirm-Dialog -Message 'There are unsaved changes. Exit anyway?')) { $_.Cancel = $true }
     }
 })
 

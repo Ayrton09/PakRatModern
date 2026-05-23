@@ -13,6 +13,7 @@
 - Optimized scan performance with VMT dependency caching.
 - Optimized base VPK lookup with a compiled helper for targeted VPK directory parsing.
 - Optimized disk existence checks during scan.
+- Improved dark theme consistency across app-owned dialogs and controls.
 - Updated app version to `1.1.0`.
 - Updated EXE metadata to `1.1.0.0`.
 - Removed the extra "Dark UI" line from About.
