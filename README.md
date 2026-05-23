@@ -2,7 +2,7 @@
 
 Modern PakRat-style tool for editing the `PAKFILE` lump inside Source `.bsp` maps.
 
-![PakRat Modern screenshot](docs/pakrat-modern-screenshot.png)
+![PakRat Modern screenshot](docs/pakrat-modern-screenshot-1.1.0.png)
 
 It includes:
 - Native Windows GUI
