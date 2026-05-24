@@ -33,7 +33,7 @@ function Get-AppBasePath {
 
 $script:AppBasePath = Get-AppBasePath
 $script:StartupLogPath = Join-Path $script:AppBasePath 'PakRatModern-startup.log'
-$script:AppVersion = '1.2.0'
+$script:AppVersion = '1.2.1'
 
 function Write-StartupLog {
     param(
@@ -202,6 +202,45 @@ public static class PakRatListViewNative
         {
             ShowScrollBar(handle, SB_VERT, false);
         }
+    }
+}
+"@
+}
+
+if (-not ('PakRatCrc32' -as [type])) {
+    Add-Type -ReferencedAssemblies @('System.dll') -TypeDefinition @"
+using System;
+
+public static class PakRatCrc32
+{
+    private static readonly uint[] Table = CreateTable();
+
+    private static uint[] CreateTable()
+    {
+        uint[] table = new uint[256];
+        for (uint i = 0; i < table.Length; i++)
+        {
+            uint crc = i;
+            for (int j = 0; j < 8; j++)
+            {
+                crc = ((crc & 1) != 0) ? ((crc >> 1) ^ 0xEDB88320u) : (crc >> 1);
+            }
+            table[i] = crc;
+        }
+        return table;
+    }
+
+    public static uint Compute(byte[] bytes)
+    {
+        uint crc = 0xFFFFFFFFu;
+        if (bytes != null)
+        {
+            for (int i = 0; i < bytes.Length; i++)
+            {
+                crc = (crc >> 8) ^ Table[(crc ^ bytes[i]) & 0xFF];
+            }
+        }
+        return crc ^ 0xFFFFFFFFu;
     }
 }
 "@
@@ -2454,6 +2493,56 @@ function Read-PakEntriesFromBspLump {
     finally { $ms.Dispose() }
 }
 
+function Get-Crc32 {
+    param([byte[]]$Bytes)
+
+    return [PakRatCrc32]::Compute($Bytes)
+}
+
+function Write-ZipUInt16 {
+    param([System.IO.Stream]$Stream, [uint16]$Value)
+    $bytes = [BitConverter]::GetBytes($Value)
+    $Stream.Write($bytes, 0, 2)
+}
+
+function Write-ZipUInt32 {
+    param([System.IO.Stream]$Stream, [uint32]$Value)
+    $bytes = [BitConverter]::GetBytes($Value)
+    $Stream.Write($bytes, 0, 4)
+}
+
+function Get-ZipDosTimestamp {
+    $now = [DateTime]::Now
+    $year = [Math]::Max(1980, [Math]::Min(2107, $now.Year))
+    $date = (($year - 1980) -shl 9) -bor ($now.Month -shl 5) -bor $now.Day
+    $time = ($now.Hour -shl 11) -bor ($now.Minute -shl 5) -bor ([int]($now.Second / 2))
+    return [pscustomobject]@{ Date = [uint16]$date; Time = [uint16]$time }
+}
+
+function Get-ZipEntryNameInfo {
+    param([string]$ArchivePath)
+
+    $usesUtf8 = $false
+    foreach ($ch in $ArchivePath.ToCharArray()) {
+        if ([int][char]$ch -gt 127) {
+            $usesUtf8 = $true
+            break
+        }
+    }
+
+    if ($usesUtf8) {
+        return [pscustomobject]@{
+            Bytes = [System.Text.Encoding]::UTF8.GetBytes($ArchivePath)
+            Flags = [uint16]0x0800
+        }
+    }
+
+    return [pscustomobject]@{
+        Bytes = [System.Text.Encoding]::ASCII.GetBytes($ArchivePath)
+        Flags = [uint16]0
+    }
+}
+
 function Write-PakEntries {
     param([System.Collections.IDictionary]$Entries)
     if ($Entries.Count -gt $MaxPakEntries) { throw "PAK has too many entries: $($Entries.Count). Limit: $MaxPakEntries." }
@@ -2461,22 +2550,87 @@ function Write-PakEntries {
 
     $ms = New-Object System.IO.MemoryStream
     try {
-        $zip = New-Object System.IO.Compression.ZipArchive($ms, [System.IO.Compression.ZipArchiveMode]::Create, $true)
-        try {
-            foreach ($k in (@($Entries.Keys) | Sort-Object)) {
-                Pump-UiMessages
-                $rec = $Entries[$k]
-                $zentry = $zip.CreateEntry($k, [System.IO.Compression.CompressionLevel]::Fastest)
-                $zstream = $zentry.Open()
-                try {
-                    $bytes = [byte[]]$rec.Data
-                    if ($bytes.Length -gt $MaxPakEntryBytes) { throw "PAK entry is too large: $k ($($bytes.Length) bytes). Limit: $MaxPakEntryBytes bytes." }
-                    $totalUncompressed += [int64]$bytes.Length
-                    if ($totalUncompressed -gt $MaxPakTotalBytes) { throw "PAK uncompressed total is too large. Limit: $MaxPakTotalBytes bytes." }
-                    Write-BytesToStreamResponsive -OutputStream $zstream -Bytes $bytes
-                } finally { $zstream.Dispose() }
-            }
-        } finally { $zip.Dispose() }
+        $centralRecords = New-Object System.Collections.Generic.List[object]
+        $timestamp = Get-ZipDosTimestamp
+
+        foreach ($k in (@($Entries.Keys) | Sort-Object)) {
+            Pump-UiMessages
+            $rec = $Entries[$k]
+            $bytes = [byte[]]$rec.Data
+            if ($bytes.Length -gt $MaxPakEntryBytes) { throw "PAK entry is too large: $k ($($bytes.Length) bytes). Limit: $MaxPakEntryBytes bytes." }
+            $totalUncompressed += [int64]$bytes.Length
+            if ($totalUncompressed -gt $MaxPakTotalBytes) { throw "PAK uncompressed total is too large. Limit: $MaxPakTotalBytes bytes." }
+            if ($bytes.Length -gt [uint32]::MaxValue) { throw "PAK entry is too large for classic ZIP: $k" }
+
+            $nameInfo = Get-ZipEntryNameInfo -ArchivePath $k
+            if ($nameInfo.Bytes.Length -gt [uint16]::MaxValue) { throw "PAK entry path is too long for ZIP: $k" }
+
+            $localOffset = [uint32]$ms.Position
+            $crc = Get-Crc32 -Bytes $bytes
+            $size = [uint32]$bytes.Length
+            $nameBytes = [byte[]]$nameInfo.Bytes
+            $flags = [uint16]$nameInfo.Flags
+
+            Write-ZipUInt32 -Stream $ms -Value ([uint32]0x04034b50)
+            Write-ZipUInt16 -Stream $ms -Value ([uint16]10)
+            Write-ZipUInt16 -Stream $ms -Value $flags
+            Write-ZipUInt16 -Stream $ms -Value ([uint16]0)
+            Write-ZipUInt16 -Stream $ms -Value $timestamp.Time
+            Write-ZipUInt16 -Stream $ms -Value $timestamp.Date
+            Write-ZipUInt32 -Stream $ms -Value $crc
+            Write-ZipUInt32 -Stream $ms -Value $size
+            Write-ZipUInt32 -Stream $ms -Value $size
+            Write-ZipUInt16 -Stream $ms -Value ([uint16]$nameBytes.Length)
+            Write-ZipUInt16 -Stream $ms -Value ([uint16]0)
+            $ms.Write($nameBytes, 0, $nameBytes.Length)
+            Write-BytesToStreamResponsive -OutputStream $ms -Bytes $bytes
+
+            [void]$centralRecords.Add([pscustomobject]@{
+                NameBytes = $nameBytes
+                Flags = $flags
+                Crc = $crc
+                Size = $size
+                LocalOffset = $localOffset
+                Time = $timestamp.Time
+                Date = $timestamp.Date
+            })
+        }
+
+        $centralOffset = [uint32]$ms.Position
+        foreach ($record in $centralRecords) {
+            Pump-UiMessages
+            $nameBytes = [byte[]]$record.NameBytes
+            Write-ZipUInt32 -Stream $ms -Value ([uint32]0x02014b50)
+            Write-ZipUInt16 -Stream $ms -Value ([uint16]20)
+            Write-ZipUInt16 -Stream $ms -Value ([uint16]10)
+            Write-ZipUInt16 -Stream $ms -Value ([uint16]$record.Flags)
+            Write-ZipUInt16 -Stream $ms -Value ([uint16]0)
+            Write-ZipUInt16 -Stream $ms -Value ([uint16]$record.Time)
+            Write-ZipUInt16 -Stream $ms -Value ([uint16]$record.Date)
+            Write-ZipUInt32 -Stream $ms -Value ([uint32]$record.Crc)
+            Write-ZipUInt32 -Stream $ms -Value ([uint32]$record.Size)
+            Write-ZipUInt32 -Stream $ms -Value ([uint32]$record.Size)
+            Write-ZipUInt16 -Stream $ms -Value ([uint16]$nameBytes.Length)
+            Write-ZipUInt16 -Stream $ms -Value ([uint16]0)
+            Write-ZipUInt16 -Stream $ms -Value ([uint16]0)
+            Write-ZipUInt16 -Stream $ms -Value ([uint16]0)
+            Write-ZipUInt16 -Stream $ms -Value ([uint16]0)
+            Write-ZipUInt32 -Stream $ms -Value ([uint32]0)
+            Write-ZipUInt32 -Stream $ms -Value ([uint32]$record.LocalOffset)
+            $ms.Write($nameBytes, 0, $nameBytes.Length)
+        }
+
+        $centralSize = [uint32]($ms.Position - $centralOffset)
+        if ($centralRecords.Count -gt [uint16]::MaxValue) { throw 'PAK has too many entries for classic ZIP.' }
+        Write-ZipUInt32 -Stream $ms -Value ([uint32]0x06054b50)
+        Write-ZipUInt16 -Stream $ms -Value ([uint16]0)
+        Write-ZipUInt16 -Stream $ms -Value ([uint16]0)
+        Write-ZipUInt16 -Stream $ms -Value ([uint16]$centralRecords.Count)
+        Write-ZipUInt16 -Stream $ms -Value ([uint16]$centralRecords.Count)
+        Write-ZipUInt32 -Stream $ms -Value $centralSize
+        Write-ZipUInt32 -Stream $ms -Value $centralOffset
+        Write-ZipUInt16 -Stream $ms -Value ([uint16]0)
+
         return ,$ms.ToArray()
     } finally { $ms.Dispose() }
 }
@@ -3742,6 +3896,22 @@ function Invoke-Scan {
     Update-Status 'Scan: checking base game VPKs...'
     Pump-UiMessages -MinMilliseconds 0
     $baseVpkEntries = Get-BaseVpkEntries -GameRoot $gameRoot -NeededRefs $refs
+    $optionalExtras = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+    if ($script:State.IncludeExtrasInScan -and -not [string]::IsNullOrWhiteSpace($mapName)) {
+        foreach ($optionalRef in @(
+            "maps/$mapName.nav",
+            "maps/$mapName.txt",
+            "resource/overviews/$mapName.txt",
+            "resource/overviews/$mapName.dds",
+            "resource/overviews/${mapName}_radar.dds",
+            "materials/overviews/$mapName.vmt",
+            "materials/overviews/$mapName.vtf",
+            "materials/overviews/${mapName}_radar.vmt",
+            "materials/overviews/${mapName}_radar.vtf"
+        )) {
+            [void]$optionalExtras.Add($optionalRef)
+        }
+    }
 
     Update-Status 'Scan: checking disk files...'
     Pump-UiMessages -MinMilliseconds 0
@@ -3757,6 +3927,7 @@ function Invoke-Scan {
             $exists = [System.IO.File]::Exists($full)
             $diskExistsCache[$full] = $exists
         }
+        if ((-not $exists) -and $optionalExtras.Contains($r) -and (-not $inPak)) { continue }
         $baseGame = (-not $inPak) -and (Test-BaseGameArchivePath -BaseVpkEntries $baseVpkEntries -ArchivePath $r)
         $addable = (-not $inPak) -and (-not $baseGame) -and $exists
         $status = if ($inPak) { 'Already in PAK' } elseif ($baseGame) { 'Base game VPK' } elseif ($exists) { 'Can add' } else { 'Missing on disk' }
