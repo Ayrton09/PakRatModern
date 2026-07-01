@@ -33,7 +33,7 @@ function Get-AppBasePath {
 
 $script:AppBasePath = Get-AppBasePath
 $script:StartupLogPath = Join-Path $script:AppBasePath 'PakRatModern-startup.log'
-$script:AppVersion = '1.2.1'
+$script:AppVersion = '1.2.2'
 
 function Write-StartupLog {
     param(

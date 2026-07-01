@@ -2,7 +2,7 @@
     [string]$InputFile = "$PSScriptRoot\\pakrat_modern_gui.ps1",
     [string]$OutputFile = "$PSScriptRoot\\PakRatModern.exe",
     [string]$IconFile = "$PSScriptRoot\\pakrat_modern.ico",
-    [string]$Version = '1.2.1.0'
+    [string]$Version = '1.2.2.0'
 )
 
 $ErrorActionPreference = 'Stop'
