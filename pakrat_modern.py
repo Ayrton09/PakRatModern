@@ -167,10 +167,9 @@ def write_pak_entries(entries: Dict[str, Tuple[zipfile.ZipInfo, bytes]]) -> byte
             new_info.create_system = info.create_system
             new_info.external_attr = info.external_attr
             new_info.internal_attr = info.internal_attr
-            method = info.compress_type
-            if method not in (zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED, zipfile.ZIP_BZIP2, zipfile.ZIP_LZMA):
-                method = zipfile.ZIP_DEFLATED
-            new_info.compress_type = method
+            # El motor Source solo lee entradas STORE del lump PAKFILE; forzamos
+            # sin compresion aunque la entrada original viniera deflateada/bzip2/lzma.
+            new_info.compress_type = zipfile.ZIP_STORED
             zf.writestr(new_info, data)
     return buffer.getvalue()
 
@@ -236,7 +235,7 @@ def update_pak_add(
 
         now = (1980, 1, 1, 0, 0, 0)
         info = zipfile.ZipInfo(filename=arcname, date_time=now)
-        info.compress_type = zipfile.ZIP_DEFLATED
+        info.compress_type = zipfile.ZIP_STORED
 
         if arcname in entries:
             replaced += 1

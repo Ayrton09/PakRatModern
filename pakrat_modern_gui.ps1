@@ -1873,11 +1873,32 @@ function Write-FileBytesResponsive {
         [byte[]]$Bytes
     )
 
-    $fs = [System.IO.File]::Open($Path, [System.IO.FileMode]::Create, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+    # Escritura atomica: se escribe primero a un temporal en el mismo directorio
+    # (mismo volumen) y luego se reemplaza el destino. Asi un fallo a mitad de
+    # escritura nunca deja el BSP original corrupto.
+    $fullPath = [System.IO.Path]::GetFullPath($Path)
+    $dir = [System.IO.Path]::GetDirectoryName($fullPath)
+    $tmpPath = [System.IO.Path]::Combine($dir, ([System.IO.Path]::GetFileName($fullPath) + '.' + [System.Guid]::NewGuid().ToString('N') + '.tmp'))
+
     try {
-        Write-BytesToStreamResponsive -OutputStream $fs -Bytes $Bytes
-    } finally {
-        $fs.Dispose()
+        $fs = [System.IO.File]::Open($tmpPath, [System.IO.FileMode]::Create, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+        try {
+            Write-BytesToStreamResponsive -OutputStream $fs -Bytes $Bytes
+            $fs.Flush($true)
+        } finally {
+            $fs.Dispose()
+        }
+
+        if ([System.IO.File]::Exists($fullPath)) {
+            [System.IO.File]::Replace($tmpPath, $fullPath, $null)
+        } else {
+            [System.IO.File]::Move($tmpPath, $fullPath)
+        }
+    } catch {
+        if ([System.IO.File]::Exists($tmpPath)) {
+            try { [System.IO.File]::Delete($tmpPath) } catch { }
+        }
+        throw
     }
 }
 
@@ -2889,7 +2910,11 @@ function Save-CurrentBsp {
     $pakBytes = Write-PakEntries -Entries $script:State.Entries
     $result = Apply-PakToBsp -Raw $script:State.BspRaw -Lumps $script:State.Lumps -Version $script:State.BspVersion -MapRevision $script:State.MapRevision -NewPak $pakBytes
 
-    if ($InPlace -and $CreateBackup) { [System.IO.File]::Copy($OutputPath, "$OutputPath.bak", $true) }
+    # Crear .bak siempre que se vaya a sobrescribir un archivo existente (in-place
+    # o Save As sobre un .bsp ya presente), no solo en modo in-place.
+    if ($CreateBackup -and [System.IO.File]::Exists($OutputPath)) {
+        [System.IO.File]::Copy($OutputPath, "$OutputPath.bak", $true)
+    }
 
     Write-FileBytesResponsive -Path $OutputPath -Bytes ([byte[]]$result.Raw)
     $script:State.BspRaw = [byte[]]$result.Raw
@@ -4679,7 +4704,7 @@ function Save-BspAs {
         }
         if ($dlg.ShowDialog() -ne [System.Windows.Forms.DialogResult]::OK) { return }
         if (-not (Validate-SaveReadiness -TargetLabel $dlg.FileName)) { return }
-        Save-CurrentBsp -OutputPath $dlg.FileName -InPlace:$false -CreateBackup:$false
+        Save-CurrentBsp -OutputPath $dlg.FileName -InPlace:$false -CreateBackup:$true
         $script:PathBox.Text = $dlg.FileName
         Refresh-AllViews
         Update-Status "Saved: $($dlg.FileName)"
