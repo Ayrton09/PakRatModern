@@ -31,9 +31,28 @@ function Get-AppBasePath {
     return [Environment]::CurrentDirectory
 }
 
+function Get-AppDataPath {
+    # Los datos mutables (settings y log) no van junto al ejecutable: si la app
+    # se instala en Program Files ese directorio es de solo lectura y guardar
+    # falla en cada cambio. %LOCALAPPDATA% siempre es escribible por el usuario.
+    try {
+        $local = [Environment]::GetFolderPath([Environment+SpecialFolder]::LocalApplicationData)
+        if (-not [string]::IsNullOrWhiteSpace($local)) {
+            $dir = Join-Path $local 'PakRatModern'
+            if (-not (Test-Path -LiteralPath $dir -PathType Container)) {
+                [System.IO.Directory]::CreateDirectory($dir) | Out-Null
+            }
+            return $dir
+        }
+    } catch { }
+
+    return $script:AppBasePath
+}
+
 $script:AppBasePath = Get-AppBasePath
-$script:StartupLogPath = Join-Path $script:AppBasePath 'PakRatModern-startup.log'
-$script:AppVersion = '1.2.2'
+$script:AppDataPath = Get-AppDataPath
+$script:StartupLogPath = Join-Path $script:AppDataPath 'PakRatModern-startup.log'
+$script:AppVersion = '1.3.0'
 
 function Write-StartupLog {
     param(
@@ -926,7 +945,8 @@ $MaxPakEntryBytes = [int64](512MB)
 $MaxPakTotalBytes = [int64](1536MB)
 $MaxPakEntries = 20000
 
-$script:SettingsPath = Join-Path $script:AppBasePath 'pakrat_modern_gui.settings.json'
+$script:SettingsPath = Join-Path $script:AppDataPath 'pakrat_modern_gui.settings.json'
+$script:LegacySettingsPath = Join-Path $script:AppBasePath 'pakrat_modern_gui.settings.json'
 $script:MainForm = $null
 $script:StatusLabel = $null
 $script:PathBox = $null
@@ -2464,6 +2484,8 @@ function Read-PakEntriesFromStream {
     param([System.IO.Stream]$Stream)
 
     $entries = [ordered]@{}
+    $script:LastPakSkipped = New-Object System.Collections.Generic.List[string]
+    $script:LastPakDuplicates = New-Object System.Collections.Generic.List[string]
     if ($null -eq $Stream -or $Stream.Length -eq 0) { return $entries }
 
     try {
@@ -2473,7 +2495,17 @@ function Read-PakEntriesFromStream {
             $totalUncompressed = 0L
             foreach ($entry in $zip.Entries) {
                 if ($entry.FullName.EndsWith('/')) { continue }
-                $name = Normalize-ArchivePath -PathValue $entry.FullName
+
+                # Hay mapas publicados con rutas absolutas dentro del PAK
+                # ("C:/Program Files/.../x.vmt", "/sound/y.mp3"). Se descarta esa
+                # entrada, no el mapa entero: rechazar todo dejaba inaccesibles
+                # cientos de archivos validos por una sola entrada mal empaquetada.
+                try {
+                    $name = Normalize-ArchivePath -PathValue $entry.FullName
+                } catch {
+                    [void]$script:LastPakSkipped.Add($entry.FullName)
+                    continue
+                }
                 if ($entry.Length -gt $MaxPakEntryBytes) { throw "PAK entry is too large: $name ($($entry.Length) bytes). Limit: $MaxPakEntryBytes bytes." }
                 $totalUncompressed += [int64]$entry.Length
                 if ($totalUncompressed -gt $MaxPakTotalBytes) { throw "PAK uncompressed total is too large. Limit: $MaxPakTotalBytes bytes." }
@@ -2482,6 +2514,9 @@ function Read-PakEntriesFromStream {
                     $tmp = New-Object System.IO.MemoryStream
                     try {
                         Copy-StreamToMemoryResponsive -InputStream $stream -OutputStream $tmp
+                        # El motor no distingue mayusculas: dos entradas con el mismo
+                        # nombre son la misma y solo una puede cargarse.
+                        if ($entries.Contains($name)) { [void]$script:LastPakDuplicates.Add($entry.FullName) }
                         $entries[$name] = New-EntryRecord -FullPath $name -Data $tmp.ToArray() -InOriginal:$true -Modified:$false
                     } finally { $tmp.Dispose() }
                 } finally { $stream.Dispose() }
@@ -2503,11 +2538,56 @@ function Read-PakEntries {
     finally { $ms.Dispose() }
 }
 
+function Get-UnsupportedPakCompression {
+    param([byte[]]$Raw, [int]$Start, [int]$Length)
+
+    # ZipArchive de .NET solo descomprime Stored y Deflate, y falla con un mensaje
+    # generico. Se lee el directorio central a mano para poder decir que pasa: hay
+    # mapas publicados con el PAK entero en LZMA.
+    $methodNames = @{ 0='Stored'; 8='Deflate'; 9='Deflate64'; 12='BZip2'; 14='LZMA'; 95='XZ'; 98='PPMd' }
+
+    $eocd = -1
+    $limit = [Math]::Min($Length, 65557)
+    for ($i = 22; $i -le $limit; $i++) {
+        $pos = $Start + $Length - $i
+        if ($pos -lt $Start) { break }
+        if ([BitConverter]::ToUInt32($Raw, $pos) -eq 0x06054b50) { $eocd = $pos; break }
+    }
+    if ($eocd -lt 0) { return $null }
+
+    $count = [BitConverter]::ToUInt16($Raw, $eocd + 10)
+    $offset = $Start + [int][BitConverter]::ToUInt32($Raw, $eocd + 16)
+    $found = @{}
+
+    for ($i = 0; $i -lt $count; $i++) {
+        if ($offset -lt 0 -or ($offset + 46) -gt ($Start + $Length)) { break }
+        if ([BitConverter]::ToUInt32($Raw, $offset) -ne 0x02014b50) { break }
+
+        $method = [BitConverter]::ToUInt16($Raw, $offset + 10)
+        if ($method -ne 0 -and $method -ne 8) {
+            $name = if ($methodNames.ContainsKey([int]$method)) { $methodNames[[int]$method] } else { "method $method" }
+            $found[$name] = 1 + $(if ($found.ContainsKey($name)) { $found[$name] } else { 0 })
+        }
+
+        $offset += 46 + [BitConverter]::ToUInt16($Raw, $offset + 28) + [BitConverter]::ToUInt16($Raw, $offset + 30) + [BitConverter]::ToUInt16($Raw, $offset + 32)
+    }
+
+    if ($found.Count -eq 0) { return $null }
+
+    $detail = ($found.GetEnumerator() | ForEach-Object { "$($_.Value) x $($_.Name)" }) -join ', '
+    return ("This map's PAK uses a compression method that cannot be read here ($detail, out of $count entries).`n`n" +
+            "Opening it partially would silently drop those files when saving, so it is refused.`n`n" +
+            "The command line tool can read them. Running an 'add' with pakrat_modern.ps1 rewrites every entry uncompressed.")
+}
+
 function Read-PakEntriesFromBspLump {
     param([byte[]]$Raw, [object[]]$Lumps, [int]$Index)
 
     $l = $Lumps[$Index]
     if ($l.filelen -eq 0) { return [ordered]@{} }
+
+    $unsupported = Get-UnsupportedPakCompression -Raw $Raw -Start ([int]$l.fileofs) -Length ([int]$l.filelen)
+    if ($null -ne $unsupported) { throw $unsupported }
 
     $ms = [System.IO.MemoryStream]::new($Raw, [int]$l.fileofs, [int]$l.filelen, $false)
     try { return Read-PakEntriesFromStream -Stream $ms }
@@ -2533,11 +2613,11 @@ function Write-ZipUInt32 {
 }
 
 function Get-ZipDosTimestamp {
-    $now = [DateTime]::Now
-    $year = [Math]::Max(1980, [Math]::Min(2107, $now.Year))
-    $date = (($year - 1980) -shl 9) -bor ($now.Month -shl 5) -bor $now.Day
-    $time = ($now.Hour -shl 11) -bor ($now.Minute -shl 5) -bor ([int]($now.Second / 2))
-    return [pscustomobject]@{ Date = [uint16]$date; Time = [uint16]$time }
+    # Fecha fija (1980-01-01), igual que la CLI. Con [DateTime]::Now dos guardados
+    # sin cambios producian BSPs con hash distinto y las dos herramientas no eran
+    # intercambiables. El motor Source ignora este campo.
+    $date = ((1980 - 1980) -shl 9) -bor (1 -shl 5) -bor 1
+    return [pscustomobject]@{ Date = [uint16]$date; Time = [uint16]0 }
 }
 
 function Get-ZipEntryNameInfo {
@@ -2567,6 +2647,9 @@ function Get-ZipEntryNameInfo {
 function Write-PakEntries {
     param([System.Collections.IDictionary]$Entries)
     if ($Entries.Count -gt $MaxPakEntries) { throw "PAK has too many entries: $($Entries.Count). Limit: $MaxPakEntries." }
+    # El ZIP clasico (sin ZIP64) no puede representar mas de 65535 entradas en el
+    # EOCD; se valida antes de escribir nada, no despues.
+    if ($Entries.Count -gt [uint16]::MaxValue) { throw 'PAK has too many entries for classic ZIP.' }
     $totalUncompressed = 0L
 
     $ms = New-Object System.IO.MemoryStream
@@ -2574,14 +2657,20 @@ function Write-PakEntries {
         $centralRecords = New-Object System.Collections.Generic.List[object]
         $timestamp = Get-ZipDosTimestamp
 
-        foreach ($k in (@($Entries.Keys) | Sort-Object)) {
+        # Orden ordinal explicito: Sort-Object usa la cultura actual, que ubica
+        # '_pre.vmt' antes que 'A.vmt' mientras que el ordinal hace lo contrario.
+        # Sin esto el GUI y la CLI producen PAKs distintos para las mismas
+        # entradas, y el resultado depende del idioma del sistema.
+        $sortedKeys = [string[]]@($Entries.Keys)
+        [array]::Sort($sortedKeys, [System.StringComparer]::Ordinal)
+
+        foreach ($k in $sortedKeys) {
             Pump-UiMessages
             $rec = $Entries[$k]
             $bytes = [byte[]]$rec.Data
             if ($bytes.Length -gt $MaxPakEntryBytes) { throw "PAK entry is too large: $k ($($bytes.Length) bytes). Limit: $MaxPakEntryBytes bytes." }
             $totalUncompressed += [int64]$bytes.Length
             if ($totalUncompressed -gt $MaxPakTotalBytes) { throw "PAK uncompressed total is too large. Limit: $MaxPakTotalBytes bytes." }
-            if ($bytes.Length -gt [uint32]::MaxValue) { throw "PAK entry is too large for classic ZIP: $k" }
 
             $nameInfo = Get-ZipEntryNameInfo -ArchivePath $k
             if ($nameInfo.Bytes.Length -gt [uint16]::MaxValue) { throw "PAK entry path is too long for ZIP: $k" }
@@ -2593,7 +2682,7 @@ function Write-PakEntries {
             $flags = [uint16]$nameInfo.Flags
 
             Write-ZipUInt32 -Stream $ms -Value ([uint32]0x04034b50)
-            Write-ZipUInt16 -Stream $ms -Value ([uint16]10)
+            Write-ZipUInt16 -Stream $ms -Value ([uint16]20)   # version needed, igual que la CLI
             Write-ZipUInt16 -Stream $ms -Value $flags
             Write-ZipUInt16 -Stream $ms -Value ([uint16]0)
             Write-ZipUInt16 -Stream $ms -Value $timestamp.Time
@@ -2622,8 +2711,8 @@ function Write-PakEntries {
             Pump-UiMessages
             $nameBytes = [byte[]]$record.NameBytes
             Write-ZipUInt32 -Stream $ms -Value ([uint32]0x02014b50)
-            Write-ZipUInt16 -Stream $ms -Value ([uint16]20)
-            Write-ZipUInt16 -Stream $ms -Value ([uint16]10)
+            Write-ZipUInt16 -Stream $ms -Value ([uint16]20)   # version made by (create_system 0)
+            Write-ZipUInt16 -Stream $ms -Value ([uint16]20)   # version needed, igual que la CLI
             Write-ZipUInt16 -Stream $ms -Value ([uint16]$record.Flags)
             Write-ZipUInt16 -Stream $ms -Value ([uint16]0)
             Write-ZipUInt16 -Stream $ms -Value ([uint16]$record.Time)
@@ -2633,16 +2722,15 @@ function Write-PakEntries {
             Write-ZipUInt32 -Stream $ms -Value ([uint32]$record.Size)
             Write-ZipUInt16 -Stream $ms -Value ([uint16]$nameBytes.Length)
             Write-ZipUInt16 -Stream $ms -Value ([uint16]0)
-            Write-ZipUInt16 -Stream $ms -Value ([uint16]0)
-            Write-ZipUInt16 -Stream $ms -Value ([uint16]0)
-            Write-ZipUInt16 -Stream $ms -Value ([uint16]0)
-            Write-ZipUInt32 -Stream $ms -Value ([uint32]0)
+            Write-ZipUInt16 -Stream $ms -Value ([uint16]0)            # comment length
+            Write-ZipUInt16 -Stream $ms -Value ([uint16]0)            # disk number start
+            Write-ZipUInt16 -Stream $ms -Value ([uint16]0)            # internal attributes
+            Write-ZipUInt32 -Stream $ms -Value ([uint32]0x01800000)   # external attributes (0o600<<16, igual que la CLI)
             Write-ZipUInt32 -Stream $ms -Value ([uint32]$record.LocalOffset)
             $ms.Write($nameBytes, 0, $nameBytes.Length)
         }
 
         $centralSize = [uint32]($ms.Position - $centralOffset)
-        if ($centralRecords.Count -gt [uint16]::MaxValue) { throw 'PAK has too many entries for classic ZIP.' }
         Write-ZipUInt32 -Stream $ms -Value ([uint32]0x06054b50)
         Write-ZipUInt16 -Stream $ms -Value ([uint16]0)
         Write-ZipUInt16 -Stream $ms -Value ([uint16]0)
@@ -2677,7 +2765,13 @@ function Apply-PakToBsp {
     } else {
         $oldStart = $pak.fileofs
         $oldEnd = $pak.fileofs + $pak.filelen
-        $delta = $NewPak.Length - $pak.filelen
+
+        # El PAK se rellena con ceros hasta que el desplazamiento de todo lo que
+        # viene despues sea multiplo de 4. Sin esto, un PAK que no es el ultimo
+        # lump mueve a los siguientes por un delta arbitrario y les rompe la
+        # alineacion a 4 bytes que el motor Source da por sentada.
+        $padding = ((($pak.filelen - $NewPak.Length) % 4) + 4) % 4
+        $delta = ($NewPak.Length + $padding) - $pak.filelen
 
         if ($delta -ne 0 -and $game.filelen -gt 0 -and $game.fileofs -gt $oldStart) {
             throw 'Cannot resize PAKFILE because LUMP_GAME_LUMP is after it. This BSP is not safe to grow/shrink.'
@@ -2687,8 +2781,9 @@ function Apply-PakToBsp {
         if ($oldStart -gt 0) { [Array]::Copy($Raw, 0, $updated, 0, $oldStart) }
         if ($NewPak.Length -gt 0) { [Array]::Copy($NewPak, 0, $updated, $oldStart, $NewPak.Length) }
 
+        # Los bytes de relleno quedan en cero por la inicializacion del array.
         $tailLen = $Raw.Length - $oldEnd
-        if ($tailLen -gt 0) { [Array]::Copy($Raw, $oldEnd, $updated, ($oldStart + $NewPak.Length), $tailLen) }
+        if ($tailLen -gt 0) { [Array]::Copy($Raw, $oldEnd, $updated, ($oldStart + $NewPak.Length + $padding), $tailLen) }
 
         if ($delta -ne 0) {
             for ($i = 0; $i -lt $newLumps.Count; $i++) {
@@ -2717,9 +2812,20 @@ function Verify-PakEntries {
     }
 }
 function Load-Settings {
-    if (-not (Test-Path $script:SettingsPath)) { return }
+    $sourcePath = $script:SettingsPath
+    if (-not (Test-Path -LiteralPath $sourcePath -PathType Leaf)) {
+        # Migracion desde la ubicacion vieja (junto al ejecutable).
+        if ($script:LegacySettingsPath -ne $script:SettingsPath -and
+            (Test-Path -LiteralPath $script:LegacySettingsPath -PathType Leaf)) {
+            $sourcePath = $script:LegacySettingsPath
+        } else {
+            return
+        }
+    }
     try {
-        $raw = Get-Content -Raw -Path $script:SettingsPath
+        # UTF8 explicito en lectura y escritura: con la ANSI local, una ruta de
+        # juego con acentos o ene se guardaba y releia corrupta en silencio.
+        $raw = Get-Content -Raw -LiteralPath $sourcePath -Encoding UTF8
         if ([string]::IsNullOrWhiteSpace($raw)) { return }
         $obj = $raw | ConvertFrom-Json
         $script:State.SavedGameRoots = @()
@@ -2752,7 +2858,7 @@ function Save-Settings {
             BackupBeforeInPlaceSave = $script:State.BackupBeforeInPlaceSave
         }
         $json = $obj | ConvertTo-Json -Depth 3
-        Set-Content -Encoding ASCII -Path $script:SettingsPath -Value $json
+        Set-Content -Encoding UTF8 -LiteralPath $script:SettingsPath -Value $json
     } catch {
         Show-ErrorDialog -Message "Could not save settings: $($_.Exception.Message)"
     }
@@ -2954,6 +3060,20 @@ function Open-Bsp {
     Pump-UiMessages -MinMilliseconds 0
     Refresh-AllViews
     Update-Status "BSP loaded: $fullPath"
+
+    if ($script:LastPakSkipped -and $script:LastPakSkipped.Count -gt 0) {
+        $sample = ($script:LastPakSkipped | Select-Object -First 8) -join "`n"
+        $extra = if ($script:LastPakSkipped.Count -gt 8) { "`n... and $($script:LastPakSkipped.Count - 8) more" } else { '' }
+        Show-InfoDialog -Message ("{0} entr{1} in this PAK had unsafe paths and were skipped:`n`n{2}{3}`n`nSaving the BSP will remove them from the map." -f `
+            $script:LastPakSkipped.Count, $(if ($script:LastPakSkipped.Count -eq 1) { 'y' } else { 'ies' }), $sample, $extra)
+    }
+
+    if ($script:LastPakDuplicates -and $script:LastPakDuplicates.Count -gt 0) {
+        $sample = ($script:LastPakDuplicates | Select-Object -First 8) -join "`n"
+        $extra = if ($script:LastPakDuplicates.Count -gt 8) { "`n... and $($script:LastPakDuplicates.Count - 8) more" } else { '' }
+        Show-InfoDialog -Message ("{0} duplicate entr{1} merged:`n`n{2}{3}`n`nThe engine cannot tell them apart, so only one copy is kept. Saving the BSP will drop the redundant copies." -f `
+            $script:LastPakDuplicates.Count, $(if ($script:LastPakDuplicates.Count -eq 1) { 'y was' } else { 'ies were' }), $sample, $extra)
+    }
 }
 
 function Resolve-ArchivePathFromFile {

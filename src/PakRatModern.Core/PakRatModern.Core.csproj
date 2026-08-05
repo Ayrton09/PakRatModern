@@ -1,0 +1,27 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <!--
+      El core no depende de Windows: agregando net8.0 aca compila y pasa las
+      pruebas en Linux tal cual. Se deja en un solo target porque hoy la unica
+      aplicacion es la de Windows.
+    -->
+    <TargetFramework>net472</TargetFramework>
+    <LangVersion>latest</LangVersion>
+    <AssemblyTitle>PakRat Modern Core</AssemblyTitle>
+    <Product>PakRat Modern</Product>
+    <Company>Ayrton09</Company>
+    <Version>1.3.0</Version>
+    <Description>Source BSP PAKFILE lump reading and writing.</Description>
+    <GenerateAssemblyInfo>true</GenerateAssemblyInfo>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+  </PropertyGroup>
+
+  <!-- En .NET Framework estos ensamblados se referencian a mano. -->
+  <ItemGroup>
+    <Reference Include="System.IO.Compression" />
+    <Reference Include="System.IO.Compression.FileSystem" />
+    <Reference Include="System.Runtime.Serialization" />
+  </ItemGroup>
+
+</Project>

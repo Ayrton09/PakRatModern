@@ -1,0 +1,27 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net472</TargetFramework>
+    <LangVersion>latest</LangVersion>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\PakRatModern.Core\PakRatModern.Core.csproj" />
+  </ItemGroup>
+
+  <!-- El hash de referencia viaja con el build: si no, correr los tests desde
+       una copia del directorio de salida no puede verificar la paridad con la
+       CLI y el chequeo se pierde en silencio. -->
+  <ItemGroup>
+    <None Include="..\testdata\reference-pak.sha256"
+          Link="testdata\reference-pak.sha256"
+          CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Reference Include="System.IO.Compression" />
+  </ItemGroup>
+
+</Project>

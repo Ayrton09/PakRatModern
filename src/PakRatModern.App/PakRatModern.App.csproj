@@ -1,0 +1,23 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net472</TargetFramework>
+    <LangVersion>latest</LangVersion>
+    <UseWindowsForms>true</UseWindowsForms>
+
+    <AssemblyName>PakRatModern</AssemblyName>
+    <AssemblyTitle>PakRat Modern</AssemblyTitle>
+    <Product>PakRat Modern</Product>
+    <Company>Ayrton09</Company>
+    <Description>Modern Source BSP PAK editor inspired by PakRat</Description>
+    <Version>1.3.0</Version>
+    <ApplicationIcon>..\..\pakrat_modern.ico</ApplicationIcon>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\PakRatModern.Core\PakRatModern.Core.csproj" />
+  </ItemGroup>
+
+</Project>

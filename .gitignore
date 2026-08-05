@@ -8,3 +8,9 @@ release/
 pakrat_modern_gui.settings.json
 __pycache__/
 *.pyc
+
+# Artefactos de compilacion de .NET
+[Bb]in/
+[Oo]bj/
+*.user
+.vs/
