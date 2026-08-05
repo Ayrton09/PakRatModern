@@ -99,3 +99,15 @@ uncompressed, after which the GUI opens the map normally.
 - Text fields now have a visible outline. Without one an empty field blends into
   the panel behind it and there is no way to tell where to click
 - Folder pickers use the modern Explorer dialog, so a path can be typed or pasted
+
+## Verifying this download
+
+```text
+38a1b963c259706fa303f1e3e325a4dd14b98b91352779d1455c42cad3cdf028  PakRatModern-release.zip
+4696b8ff920e71a6a2ea3678c63455ec655d225937ab77406b6c8b1888c4992f  PakRatModern.exe
+d261961945164c76388f81cd011d3a91d73f84951a0befa194c14f0351cd1c75  PakRatModern.Core.dll
+```
+
+```powershell
+Get-FileHash .\PakRatModern-release.zip -Algorithm SHA256
+```

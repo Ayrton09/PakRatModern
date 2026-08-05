@@ -24,14 +24,15 @@ versions. That is the same requirement the previous releases had.
 
 ### Verifying the download
 
-GitHub records a SHA256 digest for every release asset. To confirm the zip you
-downloaded is the one that was published:
+Each release lists the SHA256 of the zip and of the binaries inside it. To check
+what you downloaded matches:
 
 ```powershell
 Get-FileHash .\PakRatModern-release.zip -Algorithm SHA256
 ```
 
-Compare it with the digest reported for the asset:
+GitHub also records a digest for the asset itself, which can be read without
+downloading it:
 
 ```powershell
 gh api repos/Ayrton09/PakRatModern/releases/latest --jq ".assets[].digest"
