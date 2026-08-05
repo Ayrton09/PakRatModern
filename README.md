@@ -10,7 +10,9 @@ It includes:
 
 ## Install and run
 
-Download `PakRatModern-release.zip` from the releases page, extract it anywhere and run:
+Download `PakRatModern-release.zip` from the
+[releases page](https://github.com/Ayrton09/PakRatModern/releases/latest),
+extract it anywhere and run:
 
 ```text
 PakRatModern.exe
@@ -22,11 +24,17 @@ versions. That is the same requirement the previous releases had.
 
 ### Verifying the download
 
-Every release publishes the SHA256 of `PakRatModern.exe` and of the zip. To check
-the file you downloaded matches:
+GitHub records a SHA256 digest for every release asset. To confirm the zip you
+downloaded is the one that was published:
 
 ```powershell
-Get-FileHash .\PakRatModern.exe -Algorithm SHA256
+Get-FileHash .\PakRatModern-release.zip -Algorithm SHA256
+```
+
+Compare it with the digest reported for the asset:
+
+```powershell
+gh api repos/Ayrton09/PakRatModern/releases/latest --jq ".assets[].digest"
 ```
 
 ## GUI
@@ -133,6 +141,7 @@ That publishes the application, packages `release\PakRatModern\` plus
 src/PakRatModern.Core/    BSP, PAK/ZIP, VPK, gameinfo, reference scanner
 src/PakRatModern.App/     WinForms interface
 pakrat_modern.py          CLI
+pakrat_modern_gui.ps1     previous PowerShell GUI, superseded by src/PakRatModern.App
 ```
 
 ## Safety and compatibility
@@ -148,6 +157,16 @@ pakrat_modern.py          CLI
 - Treats internal paths as case-insensitive, like the engine does
 - Supports validation before saving
 - Supports optional `.bak` backup before overwriting
+
+### Limitations
+
+Some maps store their PAK entries with LZMA. The GUI cannot read those, because
+it relies on the ZIP support built into .NET, which handles only Stored and
+Deflate. Such a map is refused with an explanation rather than opened partially,
+since opening it partially would drop those files on save.
+
+The CLI does read LZMA. Running an `add` with it rewrites every entry
+uncompressed, after which the GUI opens the map normally.
 
 ## Antivirus false positives
 
