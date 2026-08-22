@@ -84,3 +84,15 @@ file is being dropped.
 - The PowerShell GUI that preceded 1.3.0 moved to the `legacy/powershell-gui`
   branch. It shared the settings file with the new application and could not
   load it once new fields appeared.
+
+## Verifying this download
+
+```text
+345066af5feb68b32dd9a8f29b066e0c630d94a2141af8eea58dcdb31eec4b53  PakRatModern-release.zip
+87ff628d881d698de890913da6fd57aaad905c4290e228feec858f1dca0eec05  PakRatModern.exe
+25aedf54c72b3e5d305ed2223ad85082bee5dace4e2a099c6d2b8991cc9ed550  PakRatModern.Core.dll
+```
+
+```powershell
+Get-FileHash .\PakRatModern-release.zip -Algorithm SHA256
+```
