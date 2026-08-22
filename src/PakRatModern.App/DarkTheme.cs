@@ -39,7 +39,11 @@ namespace PakRatModern.App
         [DllImport("uxtheme.dll", CharSet = CharSet.Unicode)]
         private static extern int SetWindowTheme(IntPtr hwnd, string subAppName, string subIdList);
 
-        // SetPreferredAppMode solo se exporta por ordinal; no tiene nombre publico.
+        // SetPreferredAppMode solo se exporta por ordinal; no tiene nombre publico
+        // ni esta documentada. En builds anteriores a 1809 el ordinal 135 es
+        // AllowDarkModeForApp(bool), que interpreta el 2 como "true" sin dano;
+        // si Microsoft la quita, EnableAppDarkMode falla en silencio y los menus
+        // quedan claros, nada mas. Es cosmetica: no se depende de ella.
         [DllImport("uxtheme.dll", EntryPoint = "#135", SetLastError = true)]
         private static extern int SetPreferredAppMode(int mode);
 

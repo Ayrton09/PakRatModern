@@ -81,8 +81,10 @@ namespace PakRatModern.Core
 
                 if (lump.FileLen > 0)
                 {
+                    // Un lump que empieza dentro de la cabecera no puede ser
+                    // valido: al guardar se reescribe la cabecera encima de el.
                     var end = (long)lump.FileOfs + lump.FileLen;
-                    if (lump.FileOfs < 0 || end > raw.Length)
+                    if (lump.FileOfs < PakLimits.HeaderSize || end > raw.Length)
                         throw new InvalidDataException(
                             $"Lump {i} out of range (ofs={lump.FileOfs} len={lump.FileLen}).");
                 }

@@ -2,12 +2,13 @@
 """Genera el hash de referencia del PAK que usan los tests del core en C#.
 
 El contenido debe coincidir con SampleEntries() de src/PakRatModern.Tests.
-Si los dos escritores divergen, el test del core falla.
+Si los dos escritores divergen, el test del core falla. El fixture incluye un
+nombre con caracteres fuera de ASCII para cubrir el flag UTF-8 del ZIP y un
+nombre que empieza con guion bajo para cubrir el orden ordinal.
 """
 
 import hashlib
 import sys
-import zipfile
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
@@ -20,6 +21,7 @@ FILES = {
     "materials/A.vmt": b"AAA",
     "materials/a_b.vmt": b"ab-",
     "materials/ab.vmt": b"ab",
+    "materials/custom/señal.vmt": b"utf8",
     "models/de_dust2/x.mdl": b"mdl-data",
     "maps/de_dust2.nav": b"nav",
 }
@@ -28,9 +30,7 @@ FILES = {
 def main() -> int:
     entries = pm.PakEntries()
     for name, data in FILES.items():
-        info = zipfile.ZipInfo(filename=name, date_time=(1980, 1, 1, 0, 0, 0))
-        info.compress_type = zipfile.ZIP_STORED
-        entries[name] = (info, data)
+        entries[name] = data
 
     pak = pm.write_pak_entries(entries)
     digest = hashlib.sha256(pak).hexdigest()

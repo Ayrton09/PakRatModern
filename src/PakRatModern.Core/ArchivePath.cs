@@ -68,10 +68,17 @@ namespace PakRatModern.Core
         /// <summary>
         /// Deduce la ruta interna del PAK a partir de un archivo del disco.
         ///
-        /// Primero se prueba relativo al Game Path, que es el caso normal. Si el
-        /// archivo esta fuera de ahi, se busca una carpeta raiz conocida dentro de
-        /// la ruta: sin eso, arrastrar una carpeta suelta al programa no podria
-        /// deducir donde va el archivo dentro del mapa.
+        /// Primero se prueba relativo al Game Path, que es el caso normal. Dentro
+        /// de el, <c>custom/&lt;mod&gt;/</c> y <c>download/</c> son puntos de
+        /// montaje que el motor agrega como SearchPaths propios: un archivo en
+        /// <c>cstrike/custom/mimod/materials/x.vmt</c> se carga como
+        /// <c>materials/x.vmt</c>, asi que esa es la ruta que hay que empaquetar.
+        /// Empaquetarlo como <c>custom/mimod/materials/x.vmt</c> produce un mapa
+        /// con texturas rosas y ningun error.
+        ///
+        /// Si el archivo esta fuera del Game Path, se busca una carpeta raiz
+        /// conocida dentro de la ruta: sin eso, arrastrar una carpeta suelta al
+        /// programa no podria deducir donde va el archivo dentro del mapa.
         ///
         /// Devuelve null si no se puede deducir, en vez de inventar una ruta.
         /// </summary>
@@ -88,20 +95,55 @@ namespace PakRatModern.Core
                     root += Path.DirectorySeparatorChar;
 
                 if (full.StartsWith(root, StringComparison.OrdinalIgnoreCase))
-                    return TryNormalize(full.Substring(root.Length));
+                    return TryNormalize(StripMountPrefix(full.Substring(root.Length).Replace('\\', '/')));
             }
 
-            var parts = full.Replace('\\', '/').Split('/');
+            var fromKnownRoot = FromKnownRoot(full.Replace('\\', '/').Split('/'));
+            return fromKnownRoot == null ? null : TryNormalize(fromKnownRoot);
+        }
+
+        /// <summary>
+        /// Quita el punto de montaje (<c>custom/&lt;mod&gt;/</c> o
+        /// <c>download/</c>) de una ruta relativa al Game Path. Si tras eso el
+        /// primer segmento no es una raiz conocida, se busca una mas adentro; si
+        /// no hay ninguna, se devuelve la ruta relativa tal cual.
+        /// </summary>
+        internal static string StripMountPrefix(string relative)
+        {
+            var parts = relative.Split('/');
+            var skip = 0;
+
+            if (parts.Length > 2 && string.Equals(parts[0], "custom", StringComparison.OrdinalIgnoreCase))
+                skip = 2;
+            else if (parts.Length > 1 && string.Equals(parts[0], "download", StringComparison.OrdinalIgnoreCase))
+                skip = 1;
+
+            var remainder = skip == 0 ? relative : string.Join("/", parts, skip, parts.Length - skip);
+            var remainderParts = remainder.Split('/');
+
+            if (remainderParts.Length > 0 && IsKnownRoot(remainderParts[0]))
+                return remainder;
+
+            return FromKnownRoot(remainderParts) ?? remainder;
+        }
+
+        private static string FromKnownRoot(string[] parts)
+        {
             for (var i = 0; i < parts.Length; i++)
             {
-                foreach (var known in KnownRoots)
-                {
-                    if (!string.Equals(parts[i], known, StringComparison.OrdinalIgnoreCase)) continue;
-                    return TryNormalize(string.Join("/", parts, i, parts.Length - i));
-                }
+                if (IsKnownRoot(parts[i]))
+                    return string.Join("/", parts, i, parts.Length - i);
             }
-
             return null;
+        }
+
+        private static bool IsKnownRoot(string segment)
+        {
+            foreach (var known in KnownRoots)
+            {
+                if (string.Equals(segment, known, StringComparison.OrdinalIgnoreCase)) return true;
+            }
+            return false;
         }
 
         private static string TryNormalize(string relative)

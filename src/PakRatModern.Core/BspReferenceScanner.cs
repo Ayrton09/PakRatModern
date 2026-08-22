@@ -23,7 +23,7 @@ namespace PakRatModern.Core
             new Regex("(texture|decal|overlay|material|sprite)", RegexOptions.Compiled | RegexOptions.IgnoreCase);
 
         private static readonly Regex FileishPattern =
-            new Regex(@"([A-Za-z0-9_\-/\.]+\.(vmt|vtf|mdl|wav|mp3|pcf|txt|vcd))",
+            new Regex(@"([A-Za-z0-9_\-/\.]+\.(vmt|vtf|mdl|wav|mp3|pcf|txt|vcd|raw))",
                       RegexOptions.Compiled | RegexOptions.IgnoreCase);
 
         private static readonly string[] SkyboxSides = { "up", "dn", "lf", "rt", "ft", "bk" };
@@ -192,14 +192,19 @@ namespace PakRatModern.Core
 
         /// <summary>
         /// Archivos que no estan referenciados dentro del BSP pero que el juego
-        /// busca por convencion de nombre (radar, navegacion, overview).
+        /// busca por convencion de nombre: radar, navegacion, overview, el
+        /// manifiesto de particulas (sin el, ningun info_particle_system del
+        /// mapa encuentra sus efectos), soundscapes y sonidos del nivel.
         /// </summary>
-        private static void AddMapExtras(ISet<string> set, string mapName)
+        public static IReadOnlyList<string> MapExtras(string mapName)
         {
-            foreach (var extra in new[]
+            return new[]
             {
                 $"maps/{mapName}.nav",
                 $"maps/{mapName}.txt",
+                $"maps/{mapName}_particles.txt",
+                $"maps/{mapName}_level_sounds.txt",
+                $"scripts/soundscapes_{mapName}.txt",
                 $"resource/overviews/{mapName}.txt",
                 $"resource/overviews/{mapName}.dds",
                 $"resource/overviews/{mapName}_radar.dds",
@@ -207,10 +212,13 @@ namespace PakRatModern.Core
                 $"materials/overviews/{mapName}.vtf",
                 $"materials/overviews/{mapName}_radar.vmt",
                 $"materials/overviews/{mapName}_radar.vtf",
-            })
-            {
+            };
+        }
+
+        private static void AddMapExtras(ISet<string> set, string mapName)
+        {
+            foreach (var extra in MapExtras(mapName))
                 GameReference.AddRef(set, extra);
-            }
         }
     }
 }

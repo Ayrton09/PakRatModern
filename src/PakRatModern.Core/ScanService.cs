@@ -71,10 +71,18 @@ namespace PakRatModern.Core
         private readonly IReadOnlyDictionary<string, PakEntry> _pakEntries;
         private readonly string _gameRoot;
 
+        // Donde el juego busca archivos sueltos: el Game Path y los SearchPaths
+        // de gameinfo.txt (incluidas las subcarpetas de custom/). Mirar solo el
+        // Game Path reportaba como faltante contenido que el juego si carga.
+        private readonly IReadOnlyList<string> _searchDirs;
+
         public ScanService(IReadOnlyDictionary<string, PakEntry> pakEntries, string gameRoot)
         {
             _pakEntries = pakEntries;
             _gameRoot = gameRoot;
+            _searchDirs = string.IsNullOrWhiteSpace(gameRoot)
+                ? new List<string>()
+                : GameInfo.ResolveSearchDirectories(gameRoot);
         }
 
         public ScanResult Scan(BspFile bsp, string mapName, bool includeExtras, Action<string> onProgress = null)
@@ -99,18 +107,13 @@ namespace PakRatModern.Core
                 : new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
             var rows = new List<ScanRow>();
-            var existsCache = new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
 
             foreach (var reference in refs.OrderBy(r => r, StringComparer.OrdinalIgnoreCase))
             {
                 var inPak = _pakEntries.ContainsKey(reference);
-                var fullPath = ToDiskPath(reference);
-
-                if (!existsCache.TryGetValue(fullPath, out var exists))
-                {
-                    exists = File.Exists(fullPath);
-                    existsCache[fullPath] = exists;
-                }
+                var found = FindOnDisk(reference);
+                var exists = found != null;
+                var fullPath = found ?? ToDiskPath(reference);
 
                 // Los extras son archivos opcionales por convencion de nombre; si
                 // no existen ni estan en el PAK, no son un problema que reportar.
@@ -196,31 +199,36 @@ namespace PakRatModern.Core
                 // Convencion casi universal: el .vtf que acompania al .vmt con el
                 // mismo nombre, aunque el material no lo declare explicitamente.
                 var sameBaseVtf = vmtRef.Substring(0, vmtRef.Length - 4) + ".vtf";
-                if (_pakEntries.ContainsKey(sameBaseVtf) || File.Exists(ToDiskPath(sameBaseVtf)))
+                if (_pakEntries.ContainsKey(sameBaseVtf) || FindOnDisk(sameBaseVtf) != null)
                     refs.Add(sameBaseVtf);
             }
         }
 
         private static HashSet<string> BuildOptionalExtras(string mapName)
         {
-            return new HashSet<string>(StringComparer.OrdinalIgnoreCase)
-            {
-                $"maps/{mapName}.nav",
-                $"maps/{mapName}.txt",
-                $"resource/overviews/{mapName}.txt",
-                $"resource/overviews/{mapName}.dds",
-                $"resource/overviews/{mapName}_radar.dds",
-                $"materials/overviews/{mapName}.vmt",
-                $"materials/overviews/{mapName}.vtf",
-                $"materials/overviews/{mapName}_radar.vmt",
-                $"materials/overviews/{mapName}_radar.vtf",
-            };
+            return new HashSet<string>(BspReferenceScanner.MapExtras(mapName), StringComparer.OrdinalIgnoreCase);
         }
 
+        /// <summary>Ruta donde iria el archivo en el Game Path, exista o no.</summary>
         private string ToDiskPath(string archivePath)
         {
             if (string.IsNullOrWhiteSpace(_gameRoot)) return string.Empty;
             return Path.Combine(_gameRoot, archivePath.Replace('/', Path.DirectorySeparatorChar));
+        }
+
+        /// <summary>
+        /// Primera ruta existente en disco para la referencia, recorriendo los
+        /// SearchPaths en el orden en que lo hace el motor. Null si no esta.
+        /// </summary>
+        private string FindOnDisk(string archivePath)
+        {
+            var relative = archivePath.Replace('/', Path.DirectorySeparatorChar);
+            foreach (var dir in _searchDirs)
+            {
+                var candidate = Path.Combine(dir, relative);
+                if (File.Exists(candidate)) return candidate;
+            }
+            return null;
         }
 
         /// <summary>Lo empaquetado gana sobre el disco: es lo que el mapa lleva.</summary>
@@ -228,8 +236,8 @@ namespace PakRatModern.Core
         {
             if (_pakEntries.TryGetValue(archivePath, out var entry)) return entry.Data;
 
-            var diskPath = ToDiskPath(archivePath);
-            if (string.IsNullOrEmpty(diskPath) || !File.Exists(diskPath)) return null;
+            var diskPath = FindOnDisk(archivePath);
+            if (diskPath == null) return null;
 
             try { return File.ReadAllBytes(diskPath); }
             catch (IOException) { return null; }

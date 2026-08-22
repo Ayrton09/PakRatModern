@@ -36,6 +36,11 @@ namespace PakRatModern.App
         private bool _sortDescending;
         private bool _treeMode;
 
+        // Scan y guardado bombean mensajes para refrescar la barra de estado;
+        // sin este guard el usuario podia lanzar otra operacion (o cerrar la
+        // ventana) con el documento a medio procesar.
+        private bool _busy;
+
         public MainForm(AppSettings settings, string initialBsp)
         {
             _settings = settings;
@@ -390,7 +395,7 @@ namespace PakRatModern.App
             }
         }
 
-        private static string Sample(IReadOnlyList<string> names)
+        internal static string Sample(IReadOnlyList<string> names)
         {
             var sample = string.Join("\n", names.Take(8));
             return names.Count > 8 ? sample + $"\n... and {names.Count - 8} more" : sample;
@@ -694,8 +699,23 @@ namespace PakRatModern.App
 
             try
             {
-                _document.ExtractTo(destino, selected);
-                SetStatus($"Extracted: {selected.Count}");
+                var overwrite = true;
+                var existing = _document.FindExistingExtractionTargets(destino, selected);
+                if (existing.Count > 0)
+                {
+                    var answer = MessageBox.Show(this,
+                        $"{existing.Count} file{(existing.Count == 1 ? string.Empty : "s")} already exist in the destination:\n\n" +
+                        Sample(existing) +
+                        "\n\nYes: overwrite them.\nNo: keep the existing files and extract only the rest.",
+                        "Files already exist", MessageBoxButtons.YesNoCancel, MessageBoxIcon.Warning);
+
+                    if (answer == DialogResult.Cancel) return;
+                    overwrite = answer == DialogResult.Yes;
+                }
+
+                var written = _document.ExtractTo(destino, selected, overwrite);
+                var skipped = selected.Count - written;
+                SetStatus($"Extracted: {written}" + (skipped > 0 ? $", kept existing: {skipped}" : string.Empty));
             }
             catch (Exception ex)
             {
@@ -737,6 +757,7 @@ namespace PakRatModern.App
 
         private void SaveTo(string path)
         {
+            if (!BeginBusy()) return;
             try
             {
                 SetStatusImmediate("Saving...");
@@ -750,6 +771,30 @@ namespace PakRatModern.App
                 ShowError("Could not save BSP", ex);
                 SetStatus("Save failed");
             }
+            finally
+            {
+                EndBusy();
+            }
+        }
+
+        /// <summary>
+        /// Bloquea la ventana mientras dura una operacion que bombea mensajes.
+        /// Devuelve false si ya hay una en curso.
+        /// </summary>
+        private bool BeginBusy()
+        {
+            if (_busy) return false;
+            _busy = true;
+            Enabled = false;
+            UseWaitCursor = true;
+            return true;
+        }
+
+        private void EndBusy()
+        {
+            _busy = false;
+            UseWaitCursor = false;
+            Enabled = true;
         }
 
         // ----------------------------------------------------------------- Scan
@@ -765,7 +810,7 @@ namespace PakRatModern.App
                 return null;
             }
 
-            UseWaitCursor = true;
+            if (!BeginBusy()) return null;
             try
             {
                 var service = new ScanService(_document.Entries, gameRoot);
@@ -777,7 +822,7 @@ namespace PakRatModern.App
             }
             finally
             {
-                UseWaitCursor = false;
+                EndBusy();
             }
         }
 
@@ -794,8 +839,8 @@ namespace PakRatModern.App
 
                 using (var dialog = new ScanResultsForm(result, CurrentGameRoot()))
                 {
-                    if (dialog.ShowDialog(this) == DialogResult.OK && dialog.PathsToAdd.Count > 0)
-                        AddScannedFiles(dialog.PathsToAdd);
+                    if (dialog.ShowDialog(this) == DialogResult.OK && dialog.RowsToAdd.Count > 0)
+                        AddScannedFiles(dialog.RowsToAdd);
                 }
             }
             catch (Exception ex)
@@ -814,7 +859,7 @@ namespace PakRatModern.App
                 var result = RunScanCore();
                 if (result == null) return;
 
-                var addable = result.Rows.Where(r => r.Addable).Select(r => r.Path).ToList();
+                var addable = result.Rows.Where(r => r.Addable).ToList();
                 if (addable.Count == 0)
                 {
                     SetStatus("Nothing to add");
@@ -831,28 +876,40 @@ namespace PakRatModern.App
             }
         }
 
-        private void AddScannedFiles(IReadOnlyList<string> archivePaths)
+        /// <summary>
+        /// Empaqueta filas del scan. Se usa la ruta de disco que el scan
+        /// resolvio (puede estar en otro SearchPath, no solo en el Game Path).
+        /// </summary>
+        private void AddScannedFiles(IReadOnlyList<ScanRow> rows)
         {
-            var gameRoot = CurrentGameRoot();
             var added = 0;
+            var failed = new List<string>();
 
-            foreach (var archivePath in archivePaths)
+            foreach (var row in rows)
             {
-                var diskPath = Path.Combine(gameRoot, archivePath.Replace('/', Path.DirectorySeparatorChar));
-                if (!File.Exists(diskPath)) continue;
+                var diskPath = row.FullDiskPath;
+                if (string.IsNullOrEmpty(diskPath) || !File.Exists(diskPath)) continue;
 
                 try
                 {
-                    _document.AddOrReplace(archivePath, File.ReadAllBytes(diskPath));
+                    _document.AddOrReplace(row.Path, File.ReadAllBytes(diskPath));
                     added++;
                 }
-                catch (IOException)
+                catch (Exception ex) when (ex is IOException || ex is UnauthorizedAccessException)
                 {
+                    failed.Add(row.Path);
                 }
             }
 
             RefreshViews();
-            SetStatus($"Added {added} file(s) from scan");
+            SetStatus($"Added {added} file(s) from scan" + (failed.Count > 0 ? $", {failed.Count} could not be read" : string.Empty));
+
+            if (failed.Count > 0)
+            {
+                MessageBox.Show(this,
+                    "These files could not be read from disk:\n\n" + Sample(failed),
+                    "Some files were not added", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            }
         }
 
         // -------------------------------------------------------------- Dialogos
@@ -881,8 +938,9 @@ namespace PakRatModern.App
 
         private void ShowAbout()
         {
+            var version = typeof(MainForm).Assembly.GetName().Version;
             MessageBox.Show(this,
-                "PakRat Modern 1.3.0\n\n" +
+                $"PakRat Modern {version.Major}.{version.Minor}.{version.Build}\n\n" +
                 "Editor of the PAKFILE lump in Source .bsp maps.\n" +
                 "Native build: no PowerShell runtime, no embedded script.\n\n" +
                 $"Settings: {AppPaths.SettingsPath}",
@@ -913,7 +971,7 @@ namespace PakRatModern.App
 
         private void OnFormClosing(object sender, FormClosingEventArgs e)
         {
-            if (!ConfirmDiscardChanges()) e.Cancel = true;
+            if (_busy || !ConfirmDiscardChanges()) e.Cancel = true;
         }
 
         private bool ConfirmDiscardChanges()

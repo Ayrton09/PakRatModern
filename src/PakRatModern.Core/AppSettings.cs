@@ -21,6 +21,10 @@ namespace PakRatModern.Core
         [DataMember(Name = "SavedGameRoots")]
         public List<string> SavedGameRoots { get; set; } = new List<string>();
 
+        /// <summary>
+        /// Se conserva solo para no perder el campo al reescribir un archivo de
+        /// settings viejo. Ninguna version compilada lo consulta.
+        /// </summary>
         [DataMember(Name = "PathFixupMode")]
         public string PathFixupMode { get; set; } = "Ask";
 
@@ -85,7 +89,10 @@ namespace PakRatModern.Core
             }
         }
 
-        /// <summary>Quita rutas duplicadas, vacias o que ya no existen.</summary>
+        /// <summary>
+        /// Quita rutas duplicadas o vacias y canonicaliza las demas. No comprueba
+        /// que existan: una unidad externa desconectada no debe borrar su ruta.
+        /// </summary>
         public void Normalize()
         {
             GameRoot = NormalizeFolder(GameRoot) ?? string.Empty;

@@ -83,7 +83,15 @@ namespace PakRatModern.Core
             // Se comprueba antes de leer nada: abrir a medias un PAK con
             // entradas que no se pueden descomprimir haria que guardar las
             // borrara del mapa sin aviso.
-            var unsupported = ZipInspector.DescribeUnsupported(pakBytes);
+            string unsupported;
+            try
+            {
+                unsupported = ZipInspector.DescribeUnsupported(pakBytes);
+            }
+            catch (Exception ex)
+            {
+                throw new InvalidDataException($"PAK lump central directory could not be read: {ex.Message}", ex);
+            }
             if (unsupported != null) throw new NotSupportedException(unsupported);
 
             using (var ms = new MemoryStream(pakBytes, false))
@@ -150,26 +158,25 @@ namespace PakRatModern.Core
                             throw new InvalidDataException(
                                 $"PAK uncompressed total is too large. Limit: {PakLimits.MaxPakTotalBytes} bytes.");
 
-                        using (var source = entry.Open())
-                        using (var buffer = new MemoryStream())
+                        var data = ReadEntryBounded(entry, name);
+
+                        // Duplicados: comunes en mapas publicados. Se unifican
+                        // porque el motor solo puede cargar uno, pero se informa.
+                        // Politica: gana la ultima copia (igual que la CLI). Se
+                        // conserva la capitalizacion de la primera aparicion para
+                        // que ambas herramientas escriban el mismo nombre. Si el
+                        // contenido difiere se marca: el usuario pierde una version
+                        // y tiene que saberlo.
+                        if (entries.TryGetValue(name, out var existing))
                         {
-                            source.CopyTo(buffer);
-                            var data = buffer.ToArray();
-
-                            // Duplicados: comunes en mapas publicados y siempre de
-                            // contenido identico en el material probado. Se unifican
-                            // porque el motor solo puede cargar uno, pero se informa.
-                            // Se conserva la capitalizacion de la primera aparicion,
-                            // igual que la CLI y el GUI, para que los tres escriban
-                            // exactamente el mismo nombre.
-                            if (entries.TryGetValue(name, out var existing))
-                            {
-                                duplicateNames.Add(entry.FullName);
-                                name = existing.FullPath;
-                            }
-
-                            entries[name] = new PakEntry(name, data);
+                            var sameContent = existing.Data.Length == data.Length && existing.Data.SequenceEqual(data);
+                            duplicateNames.Add(sameContent
+                                ? entry.FullName
+                                : entry.FullName + " (different content; last copy kept)");
+                            name = existing.FullPath;
                         }
+
+                        entries[name] = new PakEntry(name, data);
                     }
                 }
             }
@@ -179,6 +186,46 @@ namespace PakRatModern.Core
             }
 
             return entries;
+        }
+
+        /// <summary>
+        /// Descomprime una entrada sin confiar en el tamano declarado.
+        ///
+        /// ZipArchive de .NET Framework no corta la descompresion al llegar al
+        /// tamano que anuncia el directorio central: un ZIP de 1 KB que declara
+        /// 10 bytes puede inflar gigabytes. Los limites de arriba se comparan
+        /// contra lo declarado, asi que aca se cuenta lo que realmente sale.
+        /// </summary>
+        private static byte[] ReadEntryBounded(ZipArchiveEntry entry, string name)
+        {
+            var declared = entry.Length;
+            if (declared < 0 || declared > PakLimits.MaxPakEntryBytes)
+                throw new InvalidDataException($"PAK entry is too large: {name} ({declared} bytes).");
+
+            var data = new byte[declared];
+            var total = 0;
+
+            using (var source = entry.Open())
+            {
+                while (total < data.Length)
+                {
+                    var read = source.Read(data, total, data.Length - total);
+                    if (read <= 0) break;
+                    total += read;
+                }
+
+                if (total != data.Length)
+                    throw new InvalidDataException(
+                        $"PAK entry {name} is truncated: declared {declared} bytes, got {total}.");
+
+                // Un byte mas de lo declarado es un ZIP que miente sobre su tamano.
+                var probe = new byte[1];
+                if (source.Read(probe, 0, 1) > 0)
+                    throw new InvalidDataException(
+                        $"PAK entry {name} is larger than declared ({declared} bytes); refusing to inflate it.");
+            }
+
+            return data;
         }
 
         public static byte[] Write(IReadOnlyDictionary<string, PakEntry> entries)

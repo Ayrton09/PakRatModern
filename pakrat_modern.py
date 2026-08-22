@@ -22,6 +22,7 @@ import os
 import re
 import struct
 import sys
+import tempfile
 import zipfile
 from collections.abc import MutableMapping
 from dataclasses import dataclass
@@ -72,12 +73,14 @@ class PakEntries(MutableMapping):
     """
 
     def __init__(self) -> None:
-        self._items: "dict[str, Tuple[str, object]]" = {}
+        self._items: "dict[str, Tuple[str, bytes]]" = {}
         # Entradas descartadas al leer, como (nombre_original, motivo). Ver
         # read_pak_entries: una entrada con ruta insegura no invalida el resto.
         self.skipped: List[Tuple[str, str]] = []
         # Entradas repetidas que quedaron unificadas. Es comun: 11 de 115 mapas
-        # de CS:S probados traen duplicados, siempre de contenido identico.
+        # de CS:S probados traen duplicados. Gana la ultima copia; si su
+        # contenido difiere de la anterior se anota, porque el usuario pierde
+        # una version y tiene que saberlo.
         self.duplicates: List[str] = []
 
     def __setitem__(self, key: str, value) -> None:
@@ -143,9 +146,11 @@ def parse_bsp(path: Path) -> BSPFile:
         if filelen < 0:
             raise ValueError(f"Lump {i} tiene longitud negativa")
         if filelen > 0:
+            # Un lump que empieza dentro de la cabecera no puede ser valido: al
+            # guardar se reescribe la cabecera encima de el.
             start = fileofs
             end = start + filelen
-            if start < 0 or end > len(raw) or start > end:
+            if start < HEADER_SIZE or end > len(raw):
                 raise ValueError(f"Lump {i} fuera de rango (ofs={start}, len={filelen})")
         lumps.append(Lump(fileofs, filelen, lump_version, fourcc))
 
@@ -171,19 +176,52 @@ def _get_lump_bytes(bsp: BSPFile, index: int) -> bytes:
     return bsp.raw[lump.fileofs:lump.fileofs + lump.filelen]
 
 
+class UnsupportedCompression(ValueError):
+    """Una entrada usa un metodo que zipfile no sabe descomprimir."""
+
+
+_METHOD_NAMES = {0: "Stored", 8: "Deflate", 9: "Deflate64", 12: "BZip2", 14: "LZMA", 95: "XZ", 98: "PPMd"}
+_READABLE_METHODS = (zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED, zipfile.ZIP_BZIP2, zipfile.ZIP_LZMA)
+
+
+def _check_limits(entry_count: int, sizes: Iterable[Tuple[str, int]]) -> None:
+    """Limites compartidos por lectura, escritura y verify, con el mismo texto."""
+    if entry_count > MAX_PAK_ENTRIES:
+        raise ValueError(f"PAK tiene demasiadas entradas ({entry_count}; limite {MAX_PAK_ENTRIES})")
+    total = 0
+    for name, size in sizes:
+        if size > MAX_PAK_ENTRY_BYTES:
+            raise ValueError(f"Entrada PAK demasiado grande: {name} ({size} bytes)")
+        total += size
+        if total > MAX_PAK_TOTAL_BYTES:
+            raise ValueError(f"PAK demasiado grande descomprimido (limite {MAX_PAK_TOTAL_BYTES} bytes)")
+
+
+def _check_supported(infos: List[zipfile.ZipInfo]) -> None:
+    """Se comprueba antes de leer nada, como hace el GUI: abrir a medias un
+    PAK con entradas que no se pueden descomprimir haria que guardar las
+    borrara del mapa sin aviso."""
+    bad: "dict[int, int]" = {}
+    for info in infos:
+        if info.compress_type not in _READABLE_METHODS:
+            bad[info.compress_type] = bad.get(info.compress_type, 0) + 1
+    if bad:
+        detail = ", ".join(f"{n} x {_METHOD_NAMES.get(m, f'metodo {m}')}" for m, n in bad.items())
+        raise UnsupportedCompression(
+            f"El PAK usa un metodo de compresion que no se puede leer ({detail}, de {len(infos)} entradas)."
+        )
+
+
 def read_pak_entries(pak_bytes: bytes) -> PakEntries:
     entries = PakEntries()
     if not pak_bytes:
         return entries
 
     with zipfile.ZipFile(io.BytesIO(pak_bytes), "r") as zf:
-        infos = zf.infolist()
-        if len(infos) > MAX_PAK_ENTRIES:
-            raise ValueError(f"PAK tiene demasiadas entradas ({len(infos)}; limite {MAX_PAK_ENTRIES})")
-        total = 0
+        infos = [info for info in zf.infolist() if not info.is_dir()]
+        _check_supported(infos)
+        _check_limits(len(infos), ((info.filename, info.file_size) for info in infos))
         for info in infos:
-            if info.is_dir():
-                continue
 
             # Hay mapas publicados con rutas absolutas dentro del PAK
             # ("C:/Program Files/.../x.vmt", "/sound/y.mp3"). Se descartan esas
@@ -195,40 +233,34 @@ def read_pak_entries(pak_bytes: bytes) -> PakEntries:
                 entries.skipped.append((info.filename, str(exc)))
                 continue
 
-            if info.file_size > MAX_PAK_ENTRY_BYTES:
-                raise ValueError(f"Entrada PAK demasiado grande: {name} ({info.file_size} bytes)")
-            total += info.file_size
-            if total > MAX_PAK_TOTAL_BYTES:
-                raise ValueError(f"PAK demasiado grande descomprimido (limite {MAX_PAK_TOTAL_BYTES} bytes)")
-            data = zf.read(info.filename)
+            # Por ZipInfo y no por nombre: con nombres repetidos, zf.read(nombre)
+            # devuelve siempre la ultima copia y la primera queda inobservable.
+            data = zf.read(info)
             if name in entries:
-                entries.duplicates.append(info.filename)
-            entries[name] = (info, data)
+                if entries[name] == data:
+                    entries.duplicates.append(info.filename)
+                else:
+                    entries.duplicates.append(f"{info.filename} (contenido distinto; se conserva la ultima copia)")
+            entries[name] = data
     return entries
 
 
 def write_pak_entries(entries: PakEntries) -> bytes:
-    if len(entries) > MAX_PAK_ENTRIES:
-        raise ValueError(f"PAK tiene demasiadas entradas ({len(entries)}; limite {MAX_PAK_ENTRIES})")
-    total = 0
+    _check_limits(len(entries), ((name, len(entries[name])) for name in entries))
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, mode="w") as zf:
-        # Orden ordinal, igual que el GUI: sin ordenar, la salida dependia del
-        # orden de insercion y dos PAKs con el mismo contenido no coincidian.
-        for name in sorted(entries):
-            info, data = entries[name]
-            if len(data) > MAX_PAK_ENTRY_BYTES:
-                raise ValueError(f"Entrada PAK demasiado grande: {name} ({len(data)} bytes)")
-            total += len(data)
-            if total > MAX_PAK_TOTAL_BYTES:
-                raise ValueError(f"PAK demasiado grande descomprimido (limite {MAX_PAK_TOTAL_BYTES} bytes)")
+        # Orden por unidades UTF-16, que es lo que hace StringComparer.Ordinal
+        # en C#. sorted() ordena por code point y difiere fuera del BMP.
+        for name in sorted(entries, key=lambda n: n.encode("utf-16-be")):
+            data = entries[name]
             new_info = zipfile.ZipInfo(filename=name, date_time=CANONICAL_DATE_TIME)
-            new_info.comment = info.comment
-            new_info.internal_attr = info.internal_attr
-            # Forma canonica fija: antes se copiaban create_system y external_attr
-            # del PAK de origen, asi que el resultado dependia de con que
-            # herramienta y en que sistema se habia creado el mapa. El motor
-            # Source ignora los tres campos.
+            # Forma canonica fija, sin copiar nada del PAK de origen: antes se
+            # arrastraban comment, internal_attr, create_system y external_attr,
+            # asi que el resultado dependia de con que herramienta se habia
+            # creado el mapa y no coincidia con el del GUI. El motor Source
+            # ignora todos esos campos.
+            new_info.comment = b""
+            new_info.internal_attr = 0
             new_info.create_system = 0
             new_info.extract_version = 20
             # 0o600<<16 es lo que zipfile fuerza en _open_to_write cuando el campo
@@ -255,28 +287,37 @@ def _safe_extract_target(out_dir: Path, arcname: str) -> Path:
 def list_pak(bsp: BSPFile) -> List[Tuple[str, int]]:
     entries = read_pak_entries(_get_lump_bytes(bsp, PAK_LUMP_INDEX))
     _warn_skipped(entries)
-    return [(name, len(data)) for name, (_, data) in sorted(entries.items())]
+    return [(name, len(data)) for name, data in sorted(entries.items())]
 
 
 def extract_pak(
     bsp: BSPFile,
     out_dir: Path,
     patterns: Iterable[str] | None = None,
-) -> int:
+    overwrite: bool = False,
+) -> Tuple[int, int]:
+    """Devuelve (extraidos, saltados). Sin overwrite, un archivo que ya existe
+    en el destino se conserva en vez de pisarse."""
     entries = read_pak_entries(_get_lump_bytes(bsp, PAK_LUMP_INDEX))
     _warn_skipped(entries)
-    pattern_list = list(patterns or [])
+    # fnmatch es insensible a mayusculas en Windows y sensible en Linux; se
+    # fuerza insensible en ambos, que es como resuelve rutas el motor.
+    pattern_list = [pat.lower() for pat in (patterns or [])]
     count = 0
+    skipped = 0
 
-    for name, (_, data) in entries.items():
-        if pattern_list and not any(fnmatch.fnmatch(name, pat) for pat in pattern_list):
+    for name, data in entries.items():
+        if pattern_list and not any(fnmatch.fnmatchcase(name.lower(), pat) for pat in pattern_list):
             continue
         target = _safe_extract_target(out_dir, name)
+        if target.exists() and not overwrite:
+            skipped += 1
+            continue
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(data)
         count += 1
 
-    return count
+    return count, skipped
 
 
 def update_pak_add(
@@ -304,14 +345,11 @@ def update_pak_add(
             raise ValueError(f"Archivo demasiado grande para PAK: {file_path} ({size} bytes)")
         data = file_path.read_bytes()
 
-        info = zipfile.ZipInfo(filename=arcname, date_time=CANONICAL_DATE_TIME)
-        info.compress_type = zipfile.ZIP_STORED
-
         if arcname in entries:
             replaced += 1
         else:
             added += 1
-        entries[arcname] = (info, data)
+        entries[arcname] = data
 
     new_pak = write_pak_entries(entries)
     return added, replaced, new_pak
@@ -362,24 +400,32 @@ def verify_pak(bsp: BSPFile) -> Tuple[bool, str]:
     if not pak_bytes:
         return True, "PAK lump vacio (sin recursos embebidos)."
 
+    # Mismo criterio que el GUI: leer con las reglas de rutas, reescribir y
+    # volver a leer. Asi "valido" significa "lo que se guardaria se puede
+    # abrir", y no "el ZIP crudo pasa testzip" aunque luego se descarten
+    # entradas al guardar.
     try:
         with zipfile.ZipFile(io.BytesIO(pak_bytes), "r") as zf:
-            infos = zf.infolist()
-            if len(infos) > MAX_PAK_ENTRIES:
-                return False, f"PAK tiene demasiadas entradas ({len(infos)}; limite {MAX_PAK_ENTRIES})"
-            total = 0
-            for info in infos:
-                if info.file_size > MAX_PAK_ENTRY_BYTES:
-                    return False, f"Entrada PAK demasiado grande: {info.filename} ({info.file_size} bytes)"
-                total += info.file_size
-                if total > MAX_PAK_TOTAL_BYTES:
-                    return False, f"PAK demasiado grande descomprimido (limite {MAX_PAK_TOTAL_BYTES} bytes)"
+            _check_supported([info for info in zf.infolist() if not info.is_dir()])
             bad = zf.testzip()
             if bad:
                 return False, f"ZIP corrupto; primer archivo con error: {bad}"
-            return True, f"ZIP valido con {len(zf.infolist())} entradas"
+        entries = read_pak_entries(pak_bytes)
+        back = read_pak_entries(write_pak_entries(entries))
     except zipfile.BadZipFile as exc:
         return False, f"PAK lump no es ZIP valido: {exc}"
+    except (NotImplementedError, UnsupportedCompression) as exc:
+        return False, f"PAK con compresion no soportada: {exc}"
+    except ValueError as exc:
+        return False, str(exc)
+
+    notes = []
+    if entries.skipped:
+        notes.append(f"{len(entries.skipped)} entrada(s) con ruta insegura se descartarian al guardar")
+    if entries.duplicates:
+        notes.append(f"{len(entries.duplicates)} entrada(s) repetida(s) se unificarian")
+    suffix = f" ({'; '.join(notes)})" if notes else ""
+    return True, f"ZIP valido con {len(back)} entradas{suffix}"
 
 
 def apply_pak_to_bsp(bsp: BSPFile, new_pak: bytes) -> bytes:
@@ -440,9 +486,12 @@ def _write_bytes_atomic(target: Path, data: bytes) -> None:
     que usa el GUI (Write-FileBytesResponsive).
     """
     target = Path(target)
-    tmp_path = target.with_name(f"{target.name}.{os.getpid()}.tmp")
+    # Nombre unico y creacion exclusiva (O_EXCL): un temporal predecible se
+    # podia truncar o redirigir con un enlace colocado de antemano.
+    fd, tmp_name = tempfile.mkstemp(prefix=f"{target.name}.", suffix=".tmp", dir=str(target.parent))
+    tmp_path = Path(tmp_name)
     try:
-        with open(tmp_path, "wb") as handle:
+        with os.fdopen(fd, "wb") as handle:
             handle.write(data)
             handle.flush()
             os.fsync(handle.fileno())
@@ -455,11 +504,20 @@ def _write_bytes_atomic(target: Path, data: bytes) -> None:
         raise
 
 
-def _write_output(target: Path, data: bytes, inplace: bool, backup: bool) -> None:
-    if inplace and backup and target.exists():
+def _write_output(target: Path, data: bytes, backup: bool) -> None:
+    """Respalda siempre que se vaya a pisar un archivo existente, sea el
+    original (--inplace) o cualquier --out que ya exista; es lo que hace el
+    GUI. El .bak se reemplaza en cada guardado: es un deshacer de un paso."""
+    if backup and target.exists():
         backup_path = target.with_suffix(target.suffix + ".bak")
-        backup_path.write_bytes(target.read_bytes())
+        _write_bytes_atomic(backup_path, target.read_bytes())
     _write_bytes_atomic(target, data)
+
+
+def _resolve_output(args, default_suffix: str) -> Path:
+    if args.inplace:
+        return args.bsp
+    return args.out or args.bsp.with_stem(args.bsp.stem + default_suffix)
 
 
 def _iter_files_from_args(values: List[str]) -> List[Path]:
@@ -491,27 +549,33 @@ def main(argv: List[str] | None = None) -> int:
     p_extract = sub.add_parser("extract", help="Extraer archivos embebidos")
     p_extract.add_argument("bsp", type=Path)
     p_extract.add_argument("--out", type=Path, default=Path("extracted_pak"))
-    p_extract.add_argument("patterns", nargs="*", help="Globs opcionales")
+    p_extract.add_argument("--overwrite", action="store_true", help="Pisar archivos que ya existan en --out")
+    p_extract.add_argument("patterns", nargs="*", help="Globs opcionales (sin distinguir mayusculas)")
+
+    def add_output_options(p: argparse.ArgumentParser) -> None:
+        dest = p.add_mutually_exclusive_group()
+        dest.add_argument("--inplace", action="store_true", help="Sobrescribir el BSP original")
+        dest.add_argument("--out", type=Path, help="Ruta de salida")
+        p.add_argument("--no-backup", action="store_true", help="No crear .bak al pisar un archivo existente")
 
     p_add = sub.add_parser("add", help="Agregar o reemplazar archivos en PAK")
     p_add.add_argument("bsp", type=Path)
     p_add.add_argument("paths", nargs="+", help="Archivos o directorios a agregar")
     p_add.add_argument("--base", type=Path, required=True, help="Raiz para rutas internas")
-    p_add.add_argument("--inplace", action="store_true", help="Sobrescribir BSP original")
-    p_add.add_argument("--no-backup", action="store_true", help="No crear .bak en modo inplace")
-    p_add.add_argument("--out", type=Path, help="Ruta de salida (si no es inplace)")
+    add_output_options(p_add)
 
     p_remove = sub.add_parser("remove", help="Quitar archivos por ruta interna")
     p_remove.add_argument("bsp", type=Path)
     p_remove.add_argument("names", nargs="+")
-    p_remove.add_argument("--inplace", action="store_true")
-    p_remove.add_argument("--no-backup", action="store_true")
-    p_remove.add_argument("--out", type=Path)
+    add_output_options(p_remove)
 
     p_verify = sub.add_parser("verify", help="Verificar integridad del PAK")
     p_verify.add_argument("bsp", type=Path)
 
     args = parser.parse_args(argv)
+
+    if args.cmd == "add" and not args.base.is_dir():
+        parser.error(f"--base no es un directorio: {args.base}")
 
     try:
         bsp = parse_bsp(args.bsp)
@@ -530,8 +594,10 @@ def main(argv: List[str] | None = None) -> int:
 
         if args.cmd == "extract":
             args.out.mkdir(parents=True, exist_ok=True)
-            count = extract_pak(bsp, args.out, args.patterns)
+            count, skipped = extract_pak(bsp, args.out, args.patterns, overwrite=args.overwrite)
             print(f"Extraidos {count} archivo(s) a: {args.out}")
+            if skipped:
+                print(f"{skipped} archivo(s) ya existian y se conservaron (usa --overwrite para pisarlos)")
             return 0
 
         if args.cmd == "verify":
@@ -544,8 +610,8 @@ def main(argv: List[str] | None = None) -> int:
             added, replaced, new_pak = update_pak_add(bsp, args.base.resolve(), [p.resolve() for p in files])
             new_bytes = apply_pak_to_bsp(bsp, new_pak)
 
-            target = args.bsp if args.inplace else (args.out or args.bsp.with_stem(args.bsp.stem + "_packed"))
-            _write_output(target, new_bytes, inplace=args.inplace, backup=not args.no_backup)
+            target = _resolve_output(args, "_packed")
+            _write_output(target, new_bytes, backup=not args.no_backup)
             print(
                 f"PAK actualizado: +{added} nuevo(s), {replaced} reemplazado(s). "
                 f"Salida: {target}"
@@ -556,14 +622,16 @@ def main(argv: List[str] | None = None) -> int:
             removed, new_pak = update_pak_remove(bsp, args.names)
             new_bytes = apply_pak_to_bsp(bsp, new_pak)
 
-            target = args.bsp if args.inplace else (args.out or args.bsp.with_stem(args.bsp.stem + "_stripped"))
-            _write_output(target, new_bytes, inplace=args.inplace, backup=not args.no_backup)
+            target = _resolve_output(args, "_stripped")
+            _write_output(target, new_bytes, backup=not args.no_backup)
             print(f"PAK actualizado: {removed} eliminado(s). Salida: {target}")
             return 0
 
-        parser.error("Comando no soportado")
-        return 1
+        raise AssertionError(f"comando sin manejar: {args.cmd}")
 
+    except UnsupportedCompression as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 2
     except Exception as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 1

@@ -40,6 +40,7 @@ namespace PakRatModern.Tests
             VmtTests.Run(Check);
             ScanServiceTests.Run(Check);
             DocumentTests.Run(Check);
+            RegressionTests.Run(Check);
 
             if (Failures.Count == 0)
             {
@@ -208,10 +209,38 @@ namespace PakRatModern.Tests
             Check(ArchivePath.FromDiskPath(P(afuera, "mis materials viejos", "x.vmt"), gameRoot) == null,
                 "ruta desde disco: confundio 'mis materials viejos' con la raiz materials");
 
-            // El Game Path gana sobre la carpeta raiz conocida
+            // custom/<mod>/ y download/ son puntos de montaje del motor: lo que
+            // hay dentro se carga como si estuviera en la raiz del juego.
             Check(ArchivePath.FromDiskPath(P(gameRoot, "custom", "mimod", "materials", "z.vmt"), gameRoot)
-                    == "custom/mimod/materials/z.vmt",
-                "ruta desde disco: deberia preferir la ruta relativa al Game Path");
+                    == "materials/z.vmt",
+                "ruta desde disco: no quito el punto de montaje custom/<mod>/");
+
+            Check(ArchivePath.FromDiskPath(P(gameRoot, "download", "models", "props", "q.mdl"), gameRoot)
+                    == "models/props/q.mdl",
+                "ruta desde disco: no quito el punto de montaje download/");
+
+            // Un archivo directamente en custom/ (sin subcarpeta de mod) no es
+            // contenido montado; se deja como esta.
+            Check(ArchivePath.FromDiskPath(P(gameRoot, "custom", "readme.txt"), gameRoot)
+                    == "custom/readme.txt",
+                "ruta desde disco: trato custom/<archivo> como punto de montaje");
+
+            // Dentro del Game Path, una raiz conocida mas adentro tambien se
+            // reconoce (p. ej. una carpeta de trabajo del mapper).
+            Check(ArchivePath.FromDiskPath(P(gameRoot, "work", "v2", "materials", "w.vmt"), gameRoot)
+                    == "materials/w.vmt",
+                "ruta desde disco: no encontro la raiz conocida dentro del Game Path");
+
+            // Sin raiz conocida, la ruta relativa al Game Path se conserva
+            Check(ArchivePath.FromDiskPath(P(gameRoot, "gameinfo.txt"), gameRoot) == "gameinfo.txt",
+                "ruta desde disco: perdio una ruta relativa sin raiz conocida");
+
+            // Un Game Path que contiene una raiz conocida en su propia ruta no
+            // confunde la deduccion: se resuelve relativo al Game Path primero.
+            var rootConMaterials = Path.GetFullPath(P("juegos", "materials", "cstrike"));
+            Check(ArchivePath.FromDiskPath(P(rootConMaterials, "models", "a.mdl"), rootConMaterials)
+                    == "models/a.mdl",
+                "ruta desde disco: la palabra materials en el Game Path contamino la ruta");
 
             // Windows no distingue mayusculas en rutas; Linux si.
             if (Environment.OSVersion.Platform == PlatformID.Win32NT)
@@ -307,7 +336,7 @@ namespace PakRatModern.Tests
             Console.WriteLine($"C#   sha256: {hash}  ({pak.Length} bytes)");
 
             // Referencia generada por la CLI de Python sobre el mismo contenido
-            // (tools/Make-PakReference.ps1). Si deja de coincidir, las dos
+            // (tools/make_pak_reference.py). Si deja de coincidir, las dos
             // herramientas divergieron y los mapas dejan de ser reproducibles.
             var referencePath = FindReferenceFile();
             if (referencePath == null)
@@ -344,6 +373,7 @@ namespace PakRatModern.Tests
             Add("materials/A.vmt", "AAA");
             Add("materials/a_b.vmt", "ab-");
             Add("materials/ab.vmt", "ab");
+            Add("materials/custom/señal.vmt", "utf8");   // cubre el flag UTF-8 del ZIP
             Add("models/de_dust2/x.mdl", "mdl-data");
             Add("maps/de_dust2.nav", "nav");
             return entries;

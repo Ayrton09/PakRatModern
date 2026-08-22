@@ -153,7 +153,7 @@ namespace PakRatModern.App
         private readonly DarkListView _list;
         private readonly ScanResult _result;
 
-        public List<string> PathsToAdd { get; } = new List<string>();
+        public List<ScanRow> RowsToAdd { get; } = new List<ScanRow>();
 
         public ScanResultsForm(ScanResult result, string gameRoot)
             : base("Scan results", 940, 600, resizable: true)
@@ -263,11 +263,11 @@ namespace PakRatModern.App
 
         private void CollectChecked()
         {
-            PathsToAdd.Clear();
+            RowsToAdd.Clear();
             foreach (ListViewItem item in _list.Items)
             {
                 var row = (ScanRow)item.Tag;
-                if (item.Checked && row.Addable) PathsToAdd.Add(row.Path);
+                if (item.Checked && row.Addable) RowsToAdd.Add(row);
             }
         }
 
@@ -367,11 +367,10 @@ namespace PakRatModern.App
     {
         private readonly AppSettings _settings;
         private readonly TextBox _gameRoot;
-        private readonly ComboBox _fixupMode;
         private readonly CheckBox _includeExtras;
         private readonly CheckBox _backup;
 
-        public PreferencesForm(AppSettings settings) : base("Preferences", 700, 230)
+        public PreferencesForm(AppSettings settings) : base("Preferences", 700, 196)
         {
             _settings = settings;
 
@@ -383,39 +382,30 @@ namespace PakRatModern.App
             var browse = new Button { Text = "Browse...", Left = 588, Top = 13, Width = 88, Height = 24 };
             browse.Click += (s, e) => BrowseRoot();
 
-            var fixupLabel = new Label { Text = "Path fixup:", Left = 12, Top = 58, Width = 84, AutoSize = false };
-            _fixupMode = new ComboBox
-            {
-                Left = 100, Top = 54, Width = 180,
-                DropDownStyle = ComboBoxStyle.DropDownList,
-            };
-            _fixupMode.Items.AddRange(new object[] { "Ask", "Always", "Never" });
-            _fixupMode.SelectedItem = new[] { "Ask", "Always", "Never" }.Contains(settings.PathFixupMode)
-                ? settings.PathFixupMode
-                : "Ask";
-
             _includeExtras = new CheckBox
             {
-                Text = "Include optional extras in scan (nav, overviews, map txt, radar files)",
-                Left = 100, Top = 88, Width = 560,
+                Text = "Include optional extras in scan (nav, overviews, particles manifest, soundscapes, radar files)",
+                Left = 100, Top = 54, Width = 580,
                 Checked = settings.IncludeExtrasInScan,
             };
 
+            // El respaldo se hace siempre que se sobrescriba un BSP existente,
+            // tambien con Save As sobre otro mapa; el texto lo dice tal cual.
             _backup = new CheckBox
             {
-                Text = "Create .bak backup when saving in place",
-                Left = 100, Top = 114, Width = 560,
+                Text = "Create a .bak copy before overwriting an existing BSP (replaces the previous .bak)",
+                Left = 100, Top = 80, Width = 580,
                 Checked = settings.BackupBeforeInPlaceSave,
             };
 
-            var ok = new Button { Text = "OK", DialogResult = DialogResult.OK, Left = 514, Top = 160, Width = 75, Height = 26 };
+            var ok = new Button { Text = "OK", DialogResult = DialogResult.OK, Left = 514, Top = 126, Width = 75, Height = 26 };
             ok.Click += (s, e) => Commit();
 
-            var cancel = new Button { Text = "Cancel", DialogResult = DialogResult.Cancel, Left = 596, Top = 160, Width = 80, Height = 26 };
+            var cancel = new Button { Text = "Cancel", DialogResult = DialogResult.Cancel, Left = 596, Top = 126, Width = 80, Height = 26 };
 
             Controls.AddRange(new Control[]
             {
-                rootLabel, rootHost, browse, fixupLabel, _fixupMode, _includeExtras, _backup, ok, cancel,
+                rootLabel, rootHost, browse, _includeExtras, _backup, ok, cancel,
             });
 
             AcceptButton = ok;
@@ -433,7 +423,6 @@ namespace PakRatModern.App
             var root = _gameRoot.Text?.Trim();
             if (!string.IsNullOrWhiteSpace(root)) _settings.RememberGameRoot(root);
 
-            _settings.PathFixupMode = (string)_fixupMode.SelectedItem ?? "Ask";
             _settings.IncludeExtrasInScan = _includeExtras.Checked;
             _settings.BackupBeforeInPlaceSave = _backup.Checked;
         }

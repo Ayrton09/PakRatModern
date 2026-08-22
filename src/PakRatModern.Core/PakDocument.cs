@@ -94,18 +94,44 @@ namespace PakRatModern.Core
             IsDirty = true;
         }
 
-        public void ExtractTo(string targetRoot, IEnumerable<string> archivePaths)
+        /// <summary>
+        /// Archivos de destino que ya existen en disco para estas entradas. La
+        /// interfaz lo usa para preguntar antes de pisar algo.
+        /// </summary>
+        public IReadOnlyList<string> FindExistingExtractionTargets(string targetRoot, IEnumerable<string> archivePaths)
         {
+            var existing = new List<string>();
+            foreach (var archivePath in archivePaths)
+            {
+                if (!Entries.TryGetValue(archivePath, out var entry)) continue;
+                var target = ArchivePath.ResolveExtractionTarget(targetRoot, entry.FullPath);
+                if (File.Exists(target)) existing.Add(target);
+            }
+            return existing;
+        }
+
+        /// <summary>
+        /// Extrae entradas. Devuelve cuantas se escribieron; con
+        /// <paramref name="overwrite"/> en false, las que ya existian en disco
+        /// se saltan en lugar de pisarse.
+        /// </summary>
+        public int ExtractTo(string targetRoot, IEnumerable<string> archivePaths, bool overwrite = true)
+        {
+            var written = 0;
             foreach (var archivePath in archivePaths)
             {
                 if (!Entries.TryGetValue(archivePath, out var entry)) continue;
 
                 var target = ArchivePath.ResolveExtractionTarget(targetRoot, entry.FullPath);
+                if (!overwrite && File.Exists(target)) continue;
+
                 var dir = System.IO.Path.GetDirectoryName(target);
                 if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
 
                 File.WriteAllBytes(target, entry.Data);
+                written++;
             }
+            return written;
         }
 
         public (bool Ok, string Message) Verify() => PakArchive.Verify(Entries);

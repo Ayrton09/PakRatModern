@@ -67,6 +67,17 @@ if (-not $SkipTests) {
     if ($LASTEXITCODE -ne 0) {
         throw "Test suite failed with exit code $LASTEXITCODE. Release aborted."
     }
+
+    # La CLI viaja dentro del zip: sus pruebas tambien bloquean el release.
+    $python = Get-Command python -ErrorAction SilentlyContinue
+    if ($python) {
+        & $python.Source -m unittest discover -s (Join-Path $projectRoot 'tests')
+        if ($LASTEXITCODE -ne 0) {
+            throw "CLI test suite failed with exit code $LASTEXITCODE. Release aborted."
+        }
+    } else {
+        Write-Warning 'Python not found: CLI tests skipped.'
+    }
 }
 
 # --- Compilacion -----------------------------------------------------------

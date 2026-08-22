@@ -42,19 +42,23 @@ namespace PakRatModern.Core
             if (eocd < 0) return counts;
 
             var entryCount = BitConverter.ToUInt16(zipBytes, eocd + 10);
-            var offset = (int)BitConverter.ToUInt32(zipBytes, eocd + 16);
+
+            // Aritmetica en long: un offset cercano a uint.MaxValue desbordaba
+            // el int y pasaba el chequeo de rango con un valor negativo.
+            long offset = BitConverter.ToUInt32(zipBytes, eocd + 16);
 
             for (var i = 0; i < entryCount; i++)
             {
                 if (offset < 0 || offset + 46 > zipBytes.Length) break;
-                if (BitConverter.ToUInt32(zipBytes, offset) != CentralFileHeaderSignature) break;
+                var at = (int)offset;
+                if (BitConverter.ToUInt32(zipBytes, at) != CentralFileHeaderSignature) break;
 
-                var method = BitConverter.ToUInt16(zipBytes, offset + 10);
+                var method = BitConverter.ToUInt16(zipBytes, at + 10);
                 counts[method] = counts.TryGetValue(method, out var n) ? n + 1 : 1;
 
-                var nameLength = BitConverter.ToUInt16(zipBytes, offset + 28);
-                var extraLength = BitConverter.ToUInt16(zipBytes, offset + 30);
-                var commentLength = BitConverter.ToUInt16(zipBytes, offset + 32);
+                var nameLength = BitConverter.ToUInt16(zipBytes, at + 28);
+                var extraLength = BitConverter.ToUInt16(zipBytes, at + 30);
+                var commentLength = BitConverter.ToUInt16(zipBytes, at + 32);
                 offset += 46 + nameLength + extraLength + commentLength;
             }
 

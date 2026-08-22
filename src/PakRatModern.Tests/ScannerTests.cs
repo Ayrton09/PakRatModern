@@ -196,7 +196,9 @@ namespace PakRatModern.Tests
             check(with.Contains("maps/de_dust2.nav"), "extras: falta el .nav");
             check(with.Contains("resource/overviews/de_dust2_radar.dds"), "extras: falta el radar");
             check(with.Contains("materials/overviews/de_dust2.vmt"), "extras: falta el overview");
-            check(with.Count == 9, $"extras: se esperaban 9 archivos, hay {with.Count}");
+            check(with.Contains("maps/de_dust2_particles.txt"), "extras: falta el manifiesto de particulas");
+            check(with.Contains("scripts/soundscapes_de_dust2.txt"), "extras: falta el soundscape");
+            check(with.Count == 12, $"extras: se esperaban 12 archivos, hay {with.Count}");
         }
 
         private static HashSet<string> NewSet() => new HashSet<string>(StringComparer.OrdinalIgnoreCase);

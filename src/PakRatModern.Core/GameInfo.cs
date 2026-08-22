@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 using System.Text.RegularExpressions;
 
 namespace PakRatModern.Core
@@ -95,6 +96,57 @@ namespace PakRatModern.Core
             return Path.IsPathRooted(value)
                 ? Path.GetFullPath(value)
                 : Path.GetFullPath(Path.Combine(sourceRoot, value));
+        }
+
+        /// <summary>
+        /// Directorios donde el juego busca archivos sueltos, en orden de
+        /// prioridad: el Game Path primero y despues cada SearchPath de
+        /// gameinfo.txt que sea una carpeta existente. Un valor con comodin
+        /// final (<c>custom/*</c>) se expande a sus subcarpetas, que es como el
+        /// motor monta el contenido de terceros.
+        /// </summary>
+        public static IReadOnlyList<string> ResolveSearchDirectories(string gameRoot)
+        {
+            var result = new List<string>();
+            var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+            void Add(string dir)
+            {
+                if (string.IsNullOrWhiteSpace(dir) || !Directory.Exists(dir)) return;
+                var full = Path.GetFullPath(dir).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+                if (seen.Add(full)) result.Add(full);
+            }
+
+            if (string.IsNullOrWhiteSpace(gameRoot)) return result;
+            Add(gameRoot);
+
+            foreach (var raw in ReadSearchPathValues(gameRoot))
+            {
+                var value = raw.Trim().Trim('"').Replace('\\', '/');
+
+                if (value.EndsWith("/*", StringComparison.Ordinal))
+                {
+                    var parent = ResolveSearchPath(gameRoot, value.Substring(0, value.Length - 2));
+                    if (parent == null || !Directory.Exists(parent)) continue;
+
+                    try
+                    {
+                        foreach (var sub in Directory.GetDirectories(parent).OrderBy(d => d, StringComparer.OrdinalIgnoreCase))
+                            Add(sub);
+                    }
+                    catch (Exception)
+                    {
+                        // Carpeta inaccesible: se ignora este SearchPath.
+                    }
+                    continue;
+                }
+
+                var resolved = ResolveSearchPath(gameRoot, value);
+                if (resolved != null && !resolved.EndsWith(".vpk", StringComparison.OrdinalIgnoreCase))
+                    Add(resolved);
+            }
+
+            return result;
         }
 
         private static string CombineToken(string root, string value, int prefixLength)
