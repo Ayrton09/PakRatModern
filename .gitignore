@@ -1,6 +1,8 @@
 ﻿# Ignore generated artifacts and local-only files
 release/
 *.zip
+# Los fixtures de prueba si van al repo: el PAK con entradas LZMA es un .zip.
+!src/testdata/**/*.zip
 *.exe
 *.exe.config
 *.log
