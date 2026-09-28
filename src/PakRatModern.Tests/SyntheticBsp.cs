@@ -10,12 +10,19 @@ namespace PakRatModern.Tests
     /// </summary>
     internal static class SyntheticBsp
     {
+        /// <param name="entitiesUncompressedSize">
+        /// Distinto de 0 si <paramref name="entities"/> ya viene comprimido en
+        /// LZMA: va en el fourCC, como lo deja bspzip -repack -compress.
+        /// </param>
+        /// <param name="staticPropsCompressed">El sub-lump 'sprp' ya viene en LZMA (flag 1).</param>
         public static BspFile Build(
             byte[] entities = null,
             byte[] texDataStringData = null,
             byte[] texDataStringTable = null,
             byte[] staticPropData = null,
-            byte[] pak = null)
+            byte[] pak = null,
+            int entitiesUncompressedSize = 0,
+            bool staticPropsCompressed = false)
         {
             var lumps = new Lump[PakLimits.LumpCount];
             for (var i = 0; i < lumps.Length; i++) lumps[i] = new Lump();
@@ -37,6 +44,8 @@ namespace PakRatModern.Tests
             }
 
             Place(PakLimits.EntitiesLumpIndex, entities);
+            if (entitiesUncompressedSize != 0)
+                lumps[PakLimits.EntitiesLumpIndex].FourCc = BitConverter.GetBytes(entitiesUncompressedSize);
             Place(PakLimits.TexDataStringDataLumpIndex, texDataStringData);
             Place(PakLimits.TexDataStringTableLumpIndex, texDataStringTable);
 
@@ -52,7 +61,7 @@ namespace PakRatModern.Tests
                 var header = new List<byte>();
                 header.AddRange(BitConverter.GetBytes(1));                              // lumpCount
                 header.AddRange(BitConverter.GetBytes(PakLimits.StaticPropGameLumpId)); // id 'sprp'
-                header.AddRange(BitConverter.GetBytes((ushort)0));                      // flags
+                header.AddRange(BitConverter.GetBytes((ushort)(staticPropsCompressed ? 1 : 0))); // flags
                 header.AddRange(BitConverter.GetBytes((ushort)4));                      // version
                 header.AddRange(BitConverter.GetBytes(sprpStart));                      // fileOfs absoluto
                 header.AddRange(BitConverter.GetBytes(staticPropData.Length));          // fileLen

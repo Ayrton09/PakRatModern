@@ -1,0 +1,71 @@
+name: Release
+
+# Compila el release en GitHub y no en la PC de quien publica: asi el zip sale
+# de un commit concreto, con una atestacion de procedencia que cualquiera puede
+# verificar con `gh attestation verify`.
+#
+# Uso: `gh release create vX.Y.Z --notes-file GITHUB_RELEASE_NOTES_X.Y.Z.md`.
+# Este workflow compila, prueba, adjunta el zip y agrega los SHA256 al final de
+# las notas. Con "Run workflow" (workflow_dispatch) compila y atesta sin publicar.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    permissions:
+      contents: write        # adjuntar el zip y editar las notas
+      id-token: write        # firmar la atestacion
+      attestations: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        with:
+          dotnet-version: 10.0.x
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.x"
+
+      - name: Test, build and package
+        run: ./build_release.ps1
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: |
+            release/PakRatModern-release.zip
+            release/PakRatModern/PakRatModern.exe
+            release/PakRatModern/PakRatModern.Core.dll
+
+      - name: Attach the zip and publish its hashes
+        if: github.event_name == 'release'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          gh release upload $env:TAG release/PakRatModern-release.zip --clobber
+
+          $files = 'release/PakRatModern-release.zip', 'release/PakRatModern/PakRatModern.exe', 'release/PakRatModern/PakRatModern.Core.dll'
+          $lines = foreach ($f in $files) {
+              '{0}  {1}' -f (Get-FileHash -LiteralPath $f -Algorithm SHA256).Hash.ToLowerInvariant(), (Split-Path $f -Leaf)
+          }
+
+          $fence = '```'
+          $body = (gh release view $env:TAG --json body --jq .body) -join "`n"
+          $section = @(
+              '', '## Verifying this download', '',
+              "${fence}text", ($lines -join "`n"), $fence, '',
+              'Built by GitHub Actions from this tag. To check that the zip is the one built here:', '',
+              "${fence}powershell", "gh attestation verify PakRatModern-release.zip -R $env:GITHUB_REPOSITORY", $fence
+          ) -join "`n"
+
+          Set-Content -LiteralPath notes.md -Value ($body.TrimEnd() + "`n" + $section) -Encoding utf8
+          gh release edit $env:TAG --notes-file notes.md

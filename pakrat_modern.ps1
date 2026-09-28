@@ -15,6 +15,9 @@ function Convert-ToWslPath {
     return ($Value -replace '\\', '/')
 }
 
+# pakrat_modern.py necesita Python 3.8 o posterior.
+$versionCheck = 'import sys; raise SystemExit(0 if sys.version_info >= (3, 8) else 1)'
+
 function Test-Python3Candidate {
     param(
         [string]$Command,
@@ -24,7 +27,7 @@ function Test-Python3Candidate {
     if (-not (Get-Command $Command -ErrorAction SilentlyContinue)) { return $false }
 
     try {
-        & $Command @PrefixArgs -c "import sys; raise SystemExit(0 if sys.version_info[0] >= 3 else 1)" > $null 2> $null
+        & $Command @PrefixArgs -c $versionCheck > $null 2> $null
         return ($LASTEXITCODE -eq 0)
     } catch {
         return $false
@@ -32,14 +35,14 @@ function Test-Python3Candidate {
 }
 
 if (-not $Rest -or $Rest.Count -eq 0) {
-    Write-Host "Uso: .\pakrat_modern.ps1 <comando> [args]"
-    Write-Host "Ejemplo: .\pakrat_modern.ps1 list C:\maps\test.bsp"
+    Write-Host "Usage: .\pakrat_modern.ps1 <command> [args]"
+    Write-Host "Example: .\pakrat_modern.ps1 list C:\maps\test.bsp"
     exit 1
 }
 
 $scriptPath = Join-Path $PSScriptRoot 'pakrat_modern.py'
 if (-not (Test-Path -LiteralPath $scriptPath -PathType Leaf)) {
-    Write-Error "No se encontro pakrat_modern.py junto a este wrapper: $scriptPath"
+    Write-Error "pakrat_modern.py was not found next to this wrapper: $scriptPath"
     exit 1
 }
 
@@ -59,13 +62,20 @@ foreach ($candidate in $candidates) {
 }
 
 if (Get-Command wsl.exe -ErrorAction SilentlyContinue) {
-    $converted = New-Object System.Collections.Generic.List[string]
-    foreach ($arg in $Rest) {
-        [void]$converted.Add((Convert-ToWslPath -Value $arg))
+    & wsl.exe -e python3 -c $versionCheck > $null 2> $null
+    if ($LASTEXITCODE -eq 0) {
+        $converted = New-Object System.Collections.Generic.List[string]
+        foreach ($arg in $Rest) {
+            [void]$converted.Add((Convert-ToWslPath -Value $arg))
+        }
+
+        # --cd en el directorio actual: una ruta relativa se resuelve donde la
+        # escribio el usuario, no junto al script. -e ejecuta python3 sin pasar
+        # por el shell de Linux, que expandiria comodines y variables.
+        & wsl.exe --cd (Get-Location).ProviderPath -e python3 (Convert-ToWslPath -Value $scriptPath) @($converted.ToArray())
+        exit $LASTEXITCODE
     }
-    & wsl.exe --cd (Convert-ToWslPath -Value $PSScriptRoot) python3 (Convert-ToWslPath -Value $scriptPath) @($converted.ToArray())
-    exit $LASTEXITCODE
 }
 
-Write-Error 'No se encontro Python 3 local ni WSL con python3. Instala Python 3 o ejecuta la GUI.'
+Write-Error 'Python 3.8 or later was not found (neither on Windows nor in WSL). Install Python or use the GUI.'
 exit 1

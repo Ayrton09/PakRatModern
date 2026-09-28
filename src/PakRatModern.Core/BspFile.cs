@@ -1,5 +1,6 @@
 using System;
 using System.IO;
+using System.Linq;
 
 namespace PakRatModern.Core
 {
@@ -19,6 +20,16 @@ namespace PakRatModern.Core
         };
     }
 
+    /// <summary>Orden de los campos de cada entrada de la tabla de lumps.</summary>
+    public enum LumpLayout
+    {
+        /// <summary>fileofs, filelen, version, fourCC: casi todos los juegos.</summary>
+        Standard,
+
+        /// <summary>version, fileofs, filelen, fourCC: Left 4 Dead 2 (BSP v21).</summary>
+        VersionFirst,
+    }
+
     /// <summary>
     /// Lectura y actualizacion de un BSP de Source.
     ///
@@ -32,6 +43,9 @@ namespace PakRatModern.Core
         public int Version { get; private set; }
         public int MapRevision { get; private set; }
         public Lump[] Lumps { get; private set; }
+
+        /// <summary>Se conserva al guardar: el juego solo entiende su propio orden.</summary>
+        public LumpLayout Layout { get; private set; }
 
         public static BspFile Load(string path)
         {
@@ -57,27 +71,76 @@ namespace PakRatModern.Core
                     throw new InvalidDataException("Invalid BSP identifier (expected VBSP).");
             }
 
-            var bsp = new BspFile
+            // Left 4 Dead 2 pone la version primero en cada entrada de la tabla.
+            // Leida en el orden normal, sus offsets caen dentro de la cabecera,
+            // asi que se prueba el orden normal y, si no cuadra, el de L4D2.
+            var lumps = ReadLumpTable(raw, LumpLayout.Standard, out var error);
+            var layout = LumpLayout.Standard;
+            if (lumps == null)
+            {
+                // Una tabla danada leida en el otro orden casi siempre parece
+                // "todo vacio" (el campo de version suele ser 0). Una de L4D2 de
+                // verdad conserva todos sus lumps: tantos no vacios como offsets
+                // no nulos tiene la tabla.
+                var alternative = ReadLumpTable(raw, LumpLayout.VersionFirst, out _);
+                if (alternative != null)
+                {
+                    var nonEmpty = alternative.Count(l => l.FileLen > 0);
+                    if (nonEmpty > 0 && nonEmpty >= CountPositiveFields(raw, 1))
+                    {
+                        lumps = alternative;
+                        layout = LumpLayout.VersionFirst;
+                    }
+                }
+            }
+            if (lumps == null)
+                throw new InvalidDataException(error);
+
+            return new BspFile
             {
                 Raw = raw,
                 Version = BitConverter.ToInt32(raw, 4),
-                Lumps = new Lump[PakLimits.LumpCount],
+                Lumps = lumps,
+                Layout = layout,
+                MapRevision = BitConverter.ToInt32(raw, 8 + PakLimits.LumpCount * 16),
             };
+        }
+
+        /// <summary>Entradas de la tabla cuyo campo <paramref name="field"/> (0-2) es mayor que cero.</summary>
+        private static int CountPositiveFields(byte[] raw, int field)
+        {
+            var count = 0;
+            for (var i = 0; i < PakLimits.LumpCount; i++)
+            {
+                if (BitConverter.ToInt32(raw, 8 + i * 16 + field * 4) > 0) count++;
+            }
+            return count;
+        }
+
+        /// <summary>Tabla de lumps en ese orden de campos, o null si no es coherente.</summary>
+        private static Lump[] ReadLumpTable(byte[] raw, LumpLayout layout, out string error)
+        {
+            error = null;
+            var lumps = new Lump[PakLimits.LumpCount];
 
             var offset = 8;
             for (var i = 0; i < PakLimits.LumpCount; i++)
             {
-                var lump = new Lump
-                {
-                    FileOfs = BitConverter.ToInt32(raw, offset),
-                    FileLen = BitConverter.ToInt32(raw, offset + 4),
-                    Version = BitConverter.ToInt32(raw, offset + 8),
-                };
+                var first = BitConverter.ToInt32(raw, offset);
+                var second = BitConverter.ToInt32(raw, offset + 4);
+                var third = BitConverter.ToInt32(raw, offset + 8);
+
+                var lump = layout == LumpLayout.Standard
+                    ? new Lump { FileOfs = first, FileLen = second, Version = third }
+                    : new Lump { Version = first, FileOfs = second, FileLen = third };
                 Array.Copy(raw, offset + 12, lump.FourCc, 0, 4);
                 offset += 16;
 
                 if (lump.FileLen < 0)
-                    throw new InvalidDataException($"Lump {i} has negative length.");
+                {
+                    error = $"Lump {i} has negative length.";
+                    return null;
+                }
 
                 if (lump.FileLen > 0)
                 {
@@ -85,15 +148,16 @@ namespace PakRatModern.Core
                     // valido: al guardar se reescribe la cabecera encima de el.
                     var end = (long)lump.FileOfs + lump.FileLen;
                     if (lump.FileOfs < PakLimits.HeaderSize || end > raw.Length)
-                        throw new InvalidDataException(
-                            $"Lump {i} out of range (ofs={lump.FileOfs} len={lump.FileLen}).");
+                    {
+                        error = $"Lump {i} out of range (ofs={lump.FileOfs} len={lump.FileLen}).";
+                        return null;
+                    }
                 }
 
-                bsp.Lumps[i] = lump;
+                lumps[i] = lump;
             }
 
-            bsp.MapRevision = BitConverter.ToInt32(raw, offset);
-            return bsp;
+            return lumps;
         }
 
         public byte[] GetLumpBytes(int index)
@@ -108,6 +172,23 @@ namespace PakRatModern.Core
         }
 
         public byte[] ReadPakLump() => GetLumpBytes(PakLimits.PakLumpIndex);
+
+        /// <summary>
+        /// Contenido del lump, descomprimido si viene en LZMA. Con
+        /// <c>bspzip -repack -compress</c> el fourCC guarda el tamano original y
+        /// los datos empiezan con la cabecera 'LZMA'; leido crudo, un scan no
+        /// encuentra nada en el lump de entidades.
+        /// </summary>
+        public byte[] GetLumpData(int index)
+        {
+            var raw = GetLumpBytes(index);
+            var uncompressedSize = BitConverter.ToInt32(Lumps[index].FourCc, 0);
+
+            if (uncompressedSize > 0 && Lzma.IsSourceCompressed(raw, 0, raw.Length))
+                return Lzma.DecodeSourceBlock(raw, 0, raw.Length, PakLimits.MaxPakEntryBytes);
+
+            return raw;
+        }
 
         /// <summary>
         /// Sustituye el lump PAKFILE y devuelve el BSP completo resultante.
@@ -178,7 +259,7 @@ namespace PakRatModern.Core
                 throw new InvalidDataException(
                     $"Resulting BSP is too large: {updated.LongLength} bytes. Limit: {PakLimits.MaxBspBytes} bytes.");
 
-            var header = SerializeHeader(Version, MapRevision, lumps);
+            var header = SerializeHeader(Version, MapRevision, lumps, Layout);
             Array.Copy(header, 0, updated, 0, header.Length);
 
             Raw = updated;
@@ -186,7 +267,8 @@ namespace PakRatModern.Core
             return updated;
         }
 
-        public static byte[] SerializeHeader(int version, int mapRevision, Lump[] lumps)
+        public static byte[] SerializeHeader(int version, int mapRevision, Lump[] lumps,
+            LumpLayout layout = LumpLayout.Standard)
         {
             using (var ms = new MemoryStream())
             {
@@ -196,9 +278,12 @@ namespace PakRatModern.Core
                 for (var i = 0; i < PakLimits.LumpCount; i++)
                 {
                     var l = lumps[i];
+                    if (layout == LumpLayout.VersionFirst)
+                        ms.Write(BitConverter.GetBytes(l.Version), 0, 4);
                     ms.Write(BitConverter.GetBytes(l.FileOfs), 0, 4);
                     ms.Write(BitConverter.GetBytes(l.FileLen), 0, 4);
-                    ms.Write(BitConverter.GetBytes(l.Version), 0, 4);
+                    if (layout == LumpLayout.Standard)
+                        ms.Write(BitConverter.GetBytes(l.Version), 0, 4);
                     if (l.FourCc.Length != 4)
                         throw new InvalidDataException($"Lump {i} has invalid fourcc.");
                     ms.Write(l.FourCc, 0, 4);

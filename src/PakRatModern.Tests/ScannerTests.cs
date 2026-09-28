@@ -40,6 +40,10 @@ namespace PakRatModern.Tests
                 "material: no convirtio .vtf a .vmt");
             check(GameReference.ToMaterialVmt("custom/wall") == "materials/custom/wall.vmt",
                 "material: no agrego la extension .vmt");
+            check(GameReference.ToMaterialVmt("sprites/laser.spr") == "materials/sprites/laser.vmt",
+                "material: no convirtio .spr a .vmt");
+            check(GameReference.IsRenderTarget("_rt_WaterReflection") && !GameReference.IsRenderTarget("custom/rt_wall"),
+                "material: no distingue un render target de una textura");
         }
 
         private static void TestModelCompanions(Action<bool, string> check)
@@ -101,6 +105,37 @@ namespace PakRatModern.Tests
             check(refs.Contains("materials/detail/detailsprites.vmt"), "entidades: no detecto detailmaterial");
             check(refs.Contains("materials/decals/custom/graffiti.vmt"), "entidades: no detecto la textura del decal");
             check(!refs.Any(r => r.Contains("*")), "entidades: se colo un brush model");
+
+            TestSpritesTexturesAndScripts(check);
+        }
+
+        /// <summary>
+        /// Entidades cuyos archivos no son modelos ni materiales comunes: los
+        /// sprites guardan un material en "model", env_beam usa .spr,
+        /// env_projectedtexture carga un .vtf y los VScripts viven en
+        /// scripts/vscripts/.
+        /// </summary>
+        private static void TestSpritesTexturesAndScripts(Action<bool, string> check)
+        {
+            var entities = string.Join("\n", new[]
+            {
+                "{", "\"classname\" \"env_sprite\"", "\"model\" \"sprites/mymap/glow.vmt\"", "}",
+                "{", "\"classname\" \"env_glow\"", "\"model\" \"sprites/mymap/halo.spr\"", "}",
+                "{", "\"classname\" \"env_beam\"", "\"texture\" \"sprites/mymap/beam.spr\"", "}",
+                "{", "\"classname\" \"env_projectedtexture\"", "\"texturename\" \"effects/mymap/flashlight\"", "}",
+                "{", "\"classname\" \"logic_script\"", "\"vscripts\" \"mymap/logic.nut mymap/extra\"", "}",
+            });
+
+            var refs = BspReferenceScanner.Collect(SyntheticBsp.Build(entities: Encoding.ASCII.GetBytes(entities)), "x", false);
+
+            check(refs.Contains("materials/sprites/mymap/glow.vmt"), "entidades: no detecto el material de env_sprite");
+            check(refs.Contains("materials/sprites/mymap/halo.vmt"), "entidades: no resolvio el .spr de env_glow a .vmt");
+            check(refs.Contains("materials/sprites/mymap/beam.vmt"), "entidades: no resolvio el .spr de env_beam a .vmt");
+            check(!refs.Any(r => r.EndsWith(".spr.vmt", StringComparison.OrdinalIgnoreCase)), "entidades: genero una ruta .spr.vmt");
+            check(refs.Contains("materials/effects/mymap/flashlight.vtf") && !refs.Contains("materials/effects/mymap/flashlight.vmt"),
+                "entidades: texturename de env_projectedtexture es un .vtf, no un .vmt");
+            check(refs.Contains("scripts/vscripts/mymap/logic.nut") && refs.Contains("scripts/vscripts/mymap/extra.nut"),
+                "entidades: no detecto los VScripts");
         }
 
         private static void TestTexDataScanning(Action<bool, string> check)
@@ -183,6 +218,15 @@ namespace PakRatModern.Tests
 
             check(MdlReader.GetMaterialRefs(new byte[10]).Count == 0, "mdl: no rechazo un archivo truncado");
             check(MdlReader.GetMaterialRefs(new byte[300]).Count == 0, "mdl: no rechazo un archivo sin la firma IDST");
+
+            // Un nombre con subcarpeta se compone igual con $cdmaterials, como el motor
+            Encoding.ASCII.GetBytes("sub/wood").CopyTo(mdl, nameOffset);
+            var composed = MdlReader.GetMaterialRefs(mdl);
+            check(composed.Count == 1 && composed[0] == "materials/models/props/sub/wood.vmt",
+                $"mdl: no compuso el directorio con un nombre con subcarpeta -> {string.Join(", ", composed)}");
+
+            check(GameReference.JoinModelMaterialPath("models/props/", "sub/wood") == "models/props/sub/wood",
+                "mdl: JoinModelMaterialPath ignoro el directorio");
         }
 
         private static void TestMapExtras(Action<bool, string> check)

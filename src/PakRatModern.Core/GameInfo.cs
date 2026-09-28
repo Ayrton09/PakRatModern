@@ -99,11 +99,13 @@ namespace PakRatModern.Core
         }
 
         /// <summary>
-        /// Directorios donde el juego busca archivos sueltos, en orden de
-        /// prioridad: el Game Path primero y despues cada SearchPath de
-        /// gameinfo.txt que sea una carpeta existente. Un valor con comodin
-        /// final (<c>custom/*</c>) se expande a sus subcarpetas, que es como el
-        /// motor monta el contenido de terceros.
+        /// Directorios donde el juego busca archivos sueltos, en el orden de
+        /// SearchPaths de gameinfo.txt, que es el que usa el motor. En CS:S y TF2
+        /// <c>custom/*</c> va antes que la carpeta del juego: si un archivo esta
+        /// en los dos lugares, el motor carga el de custom/, y esa es la copia
+        /// que hay que empaquetar. Un valor con comodin final se expande a sus
+        /// subcarpetas. El Game Path se revisa siempre; si gameinfo.txt no lo
+        /// nombra, al final.
         /// </summary>
         public static IReadOnlyList<string> ResolveSearchDirectories(string gameRoot)
         {
@@ -118,7 +120,13 @@ namespace PakRatModern.Core
             }
 
             if (string.IsNullOrWhiteSpace(gameRoot)) return result;
-            Add(gameRoot);
+
+            // Un valor con caracteres que no forman una ruta se ignora, no aborta el scan.
+            string TryResolve(string value)
+            {
+                try { return ResolveSearchPath(gameRoot, value); }
+                catch (Exception ex) when (ex is ArgumentException || ex is NotSupportedException || ex is PathTooLongException) { return null; }
+            }
 
             foreach (var raw in ReadSearchPathValues(gameRoot))
             {
@@ -126,7 +134,7 @@ namespace PakRatModern.Core
 
                 if (value.EndsWith("/*", StringComparison.Ordinal))
                 {
-                    var parent = ResolveSearchPath(gameRoot, value.Substring(0, value.Length - 2));
+                    var parent = TryResolve(value.Substring(0, value.Length - 2));
                     if (parent == null || !Directory.Exists(parent)) continue;
 
                     try
@@ -141,11 +149,12 @@ namespace PakRatModern.Core
                     continue;
                 }
 
-                var resolved = ResolveSearchPath(gameRoot, value);
+                var resolved = TryResolve(value);
                 if (resolved != null && !resolved.EndsWith(".vpk", StringComparison.OrdinalIgnoreCase))
                     Add(resolved);
             }
 
+            Add(gameRoot);
             return result;
         }
 

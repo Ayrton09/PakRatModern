@@ -89,17 +89,19 @@ namespace PakRatModern.App
             // aca o la columna se ve vacia aunque el estado cambie al hacer clic.
             if (CheckBoxes && e.ColumnIndex == 0)
             {
+                var size = LogicalToDeviceUnits(CheckBoxSize);
+                var margin = LogicalToDeviceUnits(CheckBoxMargin);
                 var box = new Rectangle(
-                    e.Bounds.Left + CheckBoxMargin,
-                    e.Bounds.Top + (e.Bounds.Height - CheckBoxSize) / 2,
-                    CheckBoxSize,
-                    CheckBoxSize);
+                    e.Bounds.Left + margin,
+                    e.Bounds.Top + (e.Bounds.Height - size) / 2,
+                    size,
+                    size);
 
                 DrawCheckBox(e.Graphics, box, e.Item.Checked);
                 bounds = new Rectangle(
-                    box.Right + CheckBoxMargin,
+                    box.Right + margin,
                     e.Bounds.Top,
-                    Math.Max(0, e.Bounds.Right - box.Right - CheckBoxMargin * 2),
+                    Math.Max(0, e.Bounds.Right - box.Right - margin * 2),
                     e.Bounds.Height);
             }
 
@@ -109,7 +111,11 @@ namespace PakRatModern.App
             TextRenderer.DrawText(e.Graphics, e.SubItem.Text, Font, bounds, foreColor, flags);
         }
 
-        private static void DrawCheckBox(Graphics graphics, Rectangle box, bool isChecked)
+        /// <summary>
+        /// Casilla del tema: relleno de acento y tilde clara cuando esta marcada.
+        /// La comparte <see cref="DarkCheckBox"/> para que todas se vean igual.
+        /// </summary>
+        internal static void DrawCheckBox(Graphics graphics, Rectangle box, bool isChecked)
         {
             using (var fill = new SolidBrush(isChecked ? DarkTheme.Accent : DarkTheme.Input))
                 graphics.FillRectangle(fill, box);
@@ -119,17 +125,62 @@ namespace PakRatModern.App
 
             if (!isChecked) return;
 
-            using (var check = new Pen(DarkTheme.AccentText, 2f))
+            // Tilde en proporcion a la casilla (13 px a 100 %), para que escale con el DPI.
+            float X(float v) => box.Left + v * box.Width / 13f;
+            float Y(float v) => box.Top + v * box.Height / 13f;
+
+            using (var check = new Pen(DarkTheme.AccentText, Math.Max(2f, box.Width / 6.5f)))
             {
                 graphics.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
                 graphics.DrawLines(check, new[]
                 {
-                    new Point(box.Left + 3, box.Top + 6),
-                    new Point(box.Left + 5, box.Top + 9),
-                    new Point(box.Left + 10, box.Top + 3),
+                    new PointF(X(3), Y(6)),
+                    new PointF(X(5), Y(9)),
+                    new PointF(X(10), Y(3)),
                 });
                 graphics.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.Default;
             }
+        }
+    }
+
+    /// <summary>
+    /// CheckBox dibujado por la aplicacion. El CheckBox de WinForms en
+    /// FlatStyle.Flat pinta la tilde con el color del texto sobre un recuadro
+    /// blanco: con el texto claro del tema, una casilla marcada se veia vacia.
+    /// </summary>
+    internal sealed class DarkCheckBox : CheckBox
+    {
+        private const int BoxSize = 13;
+        private const int TextGap = 6;
+
+        public DarkCheckBox()
+        {
+            SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint |
+                     ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true);
+            ForeColor = DarkTheme.Text;
+        }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            e.Graphics.Clear(Parent?.BackColor ?? DarkTheme.Back);
+
+            var size = LogicalToDeviceUnits(BoxSize);
+            var box = new Rectangle(1, (Height - size) / 2, size, size);
+            DarkListView.DrawCheckBox(e.Graphics, box, Checked);
+
+            var textLeft = box.Right + LogicalToDeviceUnits(TextGap);
+            var textBounds = new Rectangle(textLeft, 0, Math.Max(0, Width - textLeft), Height);
+            TextRenderer.DrawText(e.Graphics, Text, Font, textBounds, Enabled ? ForeColor : DarkTheme.MutedText,
+                TextFormatFlags.VerticalCenter | TextFormatFlags.Left | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix);
+
+            if (Focused && ShowFocusCues)
+                ControlPaint.DrawFocusRectangle(e.Graphics, Rectangle.Inflate(textBounds, 0, -2), ForeColor, Parent?.BackColor ?? DarkTheme.Back);
+        }
+
+        protected override void OnCheckedChanged(EventArgs e)
+        {
+            base.OnCheckedChanged(e);
+            Invalidate();
         }
     }
 

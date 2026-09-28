@@ -46,6 +46,13 @@ GitHub also records a digest for each asset, readable without downloading:
 ```powershell
 gh api repos/Ayrton09/PakRatModern/releases/latest --jq ".assets[].digest"
 ```
+
+From 1.3.2 on, releases are built by GitHub Actions from the tagged commit and
+carry a signed build provenance attestation:
+
+```powershell
+gh attestation verify PakRatModern-release.zip -R Ayrton09/PakRatModern
+```
 </details>
 
 ---
@@ -54,23 +61,31 @@ gh api repos/Ayrton09/PakRatModern/releases/latest --jq ".assets[].digest"
 
 | | |
 |---|---|
-| **Scan** | Collects every file the map references from the entity lump, the texdata string table and the static prop lump, then follows dependencies: a `.mdl` pulls its `.vvd` / `.phy` / `.vtx` and materials, a `.vmt` pulls its textures and includes. |
-| **Classify** | Each reference is marked *Already in PAK*, *Base game VPK* (shipped with the game — not packed), *Can add* (found on disk) or *Missing on disk*. |
+| **Scan** | Collects every file the map references from the entity lump, the texdata string table and the static prop lump, then follows dependencies: a `.mdl` pulls its `.vvd` / `.vtx` / `.phy` and materials, a `.vmt` pulls its textures and includes, the particle manifest pulls its `.pcf` files and their materials, soundscapes and level sounds pull their `.wav` / `.mp3`. Sprites, projected textures and VScripts are recognised too. |
+| **Classify** | Each reference is marked *Already in PAK*, *Base game VPK* (shipped with the game — not packed), *Can add* (found on disk) or *Missing on disk*. Engine render targets (`_rt_*`) and optional model files (`.phy`, `.dx80.vtx`, `.sw.vtx`) are not reported as missing. |
 | **Pack** | Add checked results, single files, whole folders, or drag and drop. Internal paths are deduced from the disk location. |
 | **Edit** | Rename internal paths, delete entries, extract to disk, preview any entry as text or hex. |
 | **Verify** | Round-trips the PAK through the writer and reader before you save. |
-| **Save safely** | Atomic write, optional `.bak`, 4-byte lump alignment preserved, game lump guarded. |
+| **Save safely** | Atomic write, optional `.bak`, 4-byte lump alignment preserved, game lump guarded, and a warning if the BSP was recompiled since you opened it. |
 
 Files on disk are looked up in **Game Path** and in every `SearchPaths` entry of
-its `gameinfo.txt` — including `custom/*` — in the same order the engine uses.
-Content already shipped in the game's `_dir.vpk` files is recognised and left
-out of the map.
+its `gameinfo.txt` — including `custom/*` — in the same order the engine uses,
+so a file present in both `custom/` and the game folder is packed from the copy
+the game actually loads. Content already shipped in the game's `_dir.vpk` files
+is recognised and left out of the map. A model texture is looked up in each of
+its `$cdmaterials` folders in order, like the engine does, and only reported
+once if it is missing from all of them.
+
+Maps from Left 4 Dead 2, whose lump table stores its fields in a different
+order, are read and saved in their own format.
 
 <details>
 <summary><b>Optional extras the scan also checks</b></summary>
 
 These are not referenced inside the BSP but the game looks for them by name.
-They are only reported when present on disk.
+They are only reported when present on disk, and what they list is followed:
+the `.pcf` files named by the particle manifest and the sounds named by the
+soundscape and level sounds files.
 
 ```
 maps/<map>.nav                      maps/<map>.txt
@@ -96,12 +111,21 @@ own, so these are stripped:
 | `cstrike/custom/mymod/materials/custom/wall.vmt` | `materials/custom/wall.vmt` |
 | `cstrike/download/models/props/crate.mdl` | `models/props/crate.mdl` |
 | `D:\work\pack\materials\custom\wall.vmt` (outside Game Path) | `materials/custom/wall.vmt` |
+| `C:\Users\me\Documents\maps\mymap\materials\wall.vmt` (outside Game Path) | `materials/wall.vmt` |
+
+Outside the Game Path, the innermost content folder (`materials`, `models`,
+`sound`, `maps`…) wins, so folders of yours that happen to share those names
+(`Documents\maps`, `D:\Media`) do not end up inside the map;
+`materials/models/…` and `materials/maps/…` stay whole. When you add a whole
+folder, paths are taken relative to it. Files outside the Game Path are listed
+with their deduced paths for you to confirm before they are added.
 
 A file with no recognisable content folder in its path is reported instead of
 being packed under a guessed name.
 </details>
 
-Settings and the startup log live in `%LOCALAPPDATA%\PakRatModern\`.
+Settings and the startup log live in `%LOCALAPPDATA%\PakRatModern\`. The log is
+capped at 512 KB; the previous one is kept as `.old`.
 
 ---
 
@@ -118,13 +142,16 @@ WSL, so on Windows you can call it as:
 | Command | What it does |
 |---|---|
 | `list <map.bsp>` | Print every embedded file with its size |
-| `verify <map.bsp>` | Round-trip the PAK; exit code 0 valid, 2 invalid or unreadable |
+| `verify <map.bsp>` | Round-trip the PAK. Exit code 0 if valid, 2 if the PAK is damaged or uses an unsupported compression method, 1 if the BSP itself cannot be read |
 | `extract <map.bsp> [--out DIR] [--overwrite] [PATTERN ...]` | Extract all entries, or those matching case-insensitive globs. Existing files are kept unless `--overwrite` |
 | `add <map.bsp> PATH... --base DIR [--inplace \| --out FILE] [--no-backup]` | Add files or folders; internal paths are relative to `--base` |
 | `remove <map.bsp> NAME... [--inplace \| --out FILE] [--no-backup]` | Remove entries by internal path |
+| `repack <map.bsp> [--inplace \| --out FILE] [--no-backup]` | Rewrite the PAK uncompressed without adding or removing anything |
+| `--version` | Print the version |
 
-`add` and `remove` write `<map>_packed.bsp` / `<map>_stripped.bsp` by default.
-Whenever the output already exists, a `.bak` copy is made first.
+`add`, `remove` and `repack` write `<map>_packed.bsp`, `<map>_stripped.bsp` and
+`<map>_repacked.bsp` by default. Whenever the output already exists, a `.bak`
+copy is made first. On Linux the rewritten file keeps its permissions.
 
 ```powershell
 .\pakrat_modern.ps1 add C:\maps\de_mine.bsp C:\content\materials --base C:\content --inplace
@@ -140,21 +167,28 @@ each side checks it against a shared reference hash.
 - Only the `PAKFILE` lump and the offsets its resize shifts are rewritten; every other byte of the BSP is preserved.
 - Following lumps keep their 4-byte alignment. A resize is refused when `LUMP_GAME_LUMP` sits after the PAK, because its internal offsets are absolute.
 - Writes go to a temporary file in the same folder and are swapped in atomically; a failure mid-save leaves the original intact.
+- The GUI keeps the whole BSP in memory, so it checks the file before overwriting it: if the map was recompiled after you opened it, it asks before replacing the new build with the old one, and offers to reload it when you come back to the window.
+- Every entry's CRC-32 is checked when reading. A damaged PAK is refused instead of being rewritten with a fresh checksum that would hide the damage.
 - Internal paths are validated on read and write: no `..`, no absolute paths, no NTFS-invalid characters, no reserved device names. Extraction is confined to the chosen folder.
+- Names stored without the ZIP UTF-8 flag (as vbsp and bspzip write them) keep their exact bytes when saved; the engine looks those bytes up.
 - Size and entry-count limits count the bytes that actually decompress, not what the ZIP directory claims.
 - Paths are case-insensitive, like the engine. Duplicate entries are merged and reported — with a note when their contents differ.
 
 <details>
-<summary><b>Limitation: LZMA-compressed maps</b></summary>
+<summary><b>Compressed maps</b></summary>
 
-Some maps store their PAK entries with LZMA. The GUI relies on the ZIP support
-built into .NET, which handles only Stored and Deflate, so it refuses such a map
-with an explanation rather than opening it partially (which would silently drop
-those entries on save).
+Maps compressed with `bspzip -repack -compress` (common in TF2) store both their
+lumps and their PAK entries with LZMA. Both tools read them: the GUI scans the
+compressed lumps and opens the LZMA entries. Saving writes the PAK uncompressed,
+which is what the engine loads from it, and leaves the other lumps as they
+were; run `bspzip -repack -compress` again afterwards if you want the smaller
+file back.
 
-The CLI reads LZMA and BZip2. One `add` with it rewrites every entry
-uncompressed, after which the GUI opens the map normally. Methods neither tool
-reads (Deflate64, PPMd, XZ) are refused by both, by name.
+A PAK that uses BZip2 is refused by the GUI with an explanation, rather than
+opened partially (which would silently drop those entries on save). The CLI
+reads it: `repack --inplace` rewrites every entry uncompressed without adding or
+removing anything, after which the GUI opens the map normally. Methods neither
+tool reads (Deflate64, PPMd, XZ) are refused by both, by name.
 </details>
 
 <details>
@@ -181,7 +215,10 @@ powershell -ExecutionPolicy Bypass -File .\build_release.ps1
 
 That runs both test suites, publishes the application into
 `release\PakRatModern\`, zips it, and prints the SHA256 of the outputs. The
-same tests run in GitHub Actions on every push.
+same tests run in GitHub Actions on every push (the CLI on Windows and Linux,
+with Python 3.8 and the latest release). Published releases are built by the
+`Release` workflow, which attaches the zip, adds its hashes to the notes and
+signs a provenance attestation.
 
 ```powershell
 dotnet run --project src\PakRatModern.Tests\PakRatModern.Tests.csproj -c Release -f net472
@@ -189,12 +226,13 @@ python -m unittest discover -s tests
 ```
 
 ```
-src/PakRatModern.Core/    BSP, PAK/ZIP, VPK, gameinfo, reference scanner
+src/PakRatModern.Core/    BSP, PAK/ZIP, LZMA, VPK, gameinfo, reference scanner
 src/PakRatModern.App/     WinForms interface
 src/PakRatModern.Tests/   core tests (no external dependencies)
+src/testdata/             parity reference hash and LZMA fixtures
 pakrat_modern.py          CLI
 tests/                    CLI tests
-tools/                    generates the shared parity reference hash
+tools/                    generates the parity reference and the LZMA fixtures
 ```
 
 The PowerShell GUI that preceded 1.3.0 is kept on the

@@ -119,7 +119,7 @@ namespace PakRatModern.Tests
             File.WriteAllText(path, content);
         }
 
-        private static void WriteVpk(string path, params (string Ext, string Dir, string Name)[] files)
+        internal static void WriteVpk(string path, params (string Ext, string Dir, string Name)[] files)
         {
             var tree = new MemoryStream();
             foreach (var byExt in files.GroupBy(f => f.Ext))

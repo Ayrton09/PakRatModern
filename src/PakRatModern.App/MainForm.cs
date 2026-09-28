@@ -41,6 +41,11 @@ namespace PakRatModern.App
         // ventana) con el documento a medio procesar.
         private bool _busy;
 
+        // Cambio en disco por el que ya se pregunto y el usuario eligio no
+        // recargar: no se vuelve a preguntar cada vez que la ventana se activa.
+        private FileStamp? _dismissedDiskChange;
+        private bool _checkingDisk;
+
         public MainForm(AppSettings settings, string initialBsp)
         {
             _settings = settings;
@@ -52,6 +57,19 @@ namespace PakRatModern.App
                 OpenBsp(initialBsp);
             else
                 SetStatus("Load a BSP to start.");
+        }
+
+        protected override void OnLoad(EventArgs e)
+        {
+            // El minimo se fija despues de escalar, para no depender de si
+            // Scale() lo escala o no.
+            var minimum = MinimumSize;
+            MinimumSize = Size.Empty;
+            DarkTheme.ScaleForDpi(this);
+            MinimumSize = new Size(LogicalToDeviceUnits(minimum.Width), LogicalToDeviceUnits(minimum.Height));
+
+            base.OnLoad(e);
+            if (DeviceDpi != 96) CenterToScreen();
         }
 
         // ------------------------------------------------------------------ UI
@@ -69,6 +87,7 @@ namespace PakRatModern.App
             DragEnter += OnDragEnter;
             DragDrop += OnDragDrop;
             FormClosing += OnFormClosing;
+            Activated += (s, e) => CheckDiskChanges();
             LoadIcon();
 
             var mainPanel = BuildMainPanel();
@@ -339,14 +358,15 @@ namespace PakRatModern.App
 
         // ----------------------------------------------------------- Documento
 
-        private void OpenBsp(string path)
+        private void OpenBsp(string path, bool confirmDiscard = true)
         {
-            if (!ConfirmDiscardChanges()) return;
+            if (confirmDiscard && !ConfirmDiscardChanges()) return;
 
             try
             {
                 SetStatusImmediate($"Loading BSP: {path}");
                 _document = PakDocument.Open(path);
+                _dismissedDiskChange = null;
                 _pathBox.Text = _document.Path;
                 RefreshViews();
                 RefreshSummary(new ScanSummary());
@@ -604,46 +624,103 @@ namespace PakRatModern.App
         {
             if (!RequireDocument()) return;
 
-            var files = new List<string>();
-            foreach (var path in paths)
+            // Una carpeta agregada entera ancla las rutas: la carpeta que
+            // equivale a la raiz del PAK se busca una vez, no archivo por archivo.
+            var files = new List<(string File, string ContentRoot)>();
+            try
             {
-                if (File.Exists(path)) files.Add(path);
-                else if (Directory.Exists(path)) files.AddRange(Directory.GetFiles(path, "*", SearchOption.AllDirectories));
+                foreach (var path in paths)
+                {
+                    if (File.Exists(path))
+                    {
+                        files.Add((path, null));
+                    }
+                    else if (Directory.Exists(path))
+                    {
+                        var contentRoot = ArchivePath.FindContentRoot(path);
+                        foreach (var file in Directory.GetFiles(path, "*", SearchOption.AllDirectories))
+                            files.Add((file, contentRoot));
+                    }
+                }
+            }
+            catch (Exception ex) when (ex is IOException || ex is UnauthorizedAccessException)
+            {
+                ShowError("Could not read the folder", ex);
+                return;
             }
 
             if (files.Count == 0) return;
 
             var gameRoot = CurrentGameRoot();
-            int added = 0, replaced = 0;
-            var skipped = new List<string>();
+            var planned = new List<(string File, string ArchivePath)>();
+            var unmapped = new List<string>();
 
-            foreach (var file in files)
+            foreach (var (file, contentRoot) in files)
+            {
+                string archivePath = null;
+                try { archivePath = ArchivePath.FromDiskPath(file, gameRoot, contentRoot); }
+                catch (Exception ex) when (ex is ArgumentException || ex is NotSupportedException || ex is PathTooLongException) { }
+
+                if (archivePath == null) unmapped.Add(file);
+                else planned.Add((file, archivePath));
+            }
+
+            // Fuera del Game Path la ruta interna se deduce de los nombres de
+            // carpeta. Se muestra antes de agregar: una ruta mal deducida da un
+            // mapa con texturas rosas y ningun error.
+            var outside = planned.Where(p => !ArchivePath.IsInside(p.File, gameRoot)).ToList();
+            if (outside.Count > 0 && !ConfirmDeducedPaths(outside))
+            {
+                SetStatus("Add cancelled");
+                return;
+            }
+
+            int added = 0, replaced = 0;
+            var unreadable = new List<string>();
+
+            foreach (var (file, archivePath) in planned)
             {
                 try
                 {
-                    var archivePath = ArchivePath.FromDiskPath(file, gameRoot);
-                    if (archivePath == null) { skipped.Add(file); continue; }
-
                     if (_document.AddOrReplace(archivePath, File.ReadAllBytes(file))) replaced++;
                     else added++;
                 }
-                catch (Exception)
+                catch (Exception ex) when (ex is IOException || ex is UnauthorizedAccessException || ex is ArgumentException)
                 {
-                    skipped.Add(file);
+                    unreadable.Add(file);
                 }
             }
 
             RefreshViews();
-            SetStatus($"Added {added}, replaced {replaced}" + (skipped.Count > 0 ? $", skipped {skipped.Count}" : string.Empty));
+            var notAdded = unmapped.Count + unreadable.Count;
+            SetStatus($"Added {added}, replaced {replaced}" + (notAdded > 0 ? $", skipped {notAdded}" : string.Empty));
 
-            if (skipped.Count > 0)
+            if (unmapped.Count > 0)
             {
                 MessageBox.Show(this,
                     "These files could not be mapped to an internal PAK path.\n\n" +
-                    "Set Game Path to the folder containing materials/ and models/, then add them again:\n\n" +
-                    string.Join("\n", skipped.Take(10)),
+                    "Set Game Path to the folder containing materials/ and models/, or add the folder that contains them, then try again:\n\n" +
+                    Sample(unmapped),
                     "Some files were skipped", MessageBoxButtons.OK, MessageBoxIcon.Warning);
             }
+
+            if (unreadable.Count > 0)
+            {
+                MessageBox.Show(this,
+                    "These files could not be read from disk:\n\n" + Sample(unreadable),
+                    "Some files were not added", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            }
+        }
+
+        private bool ConfirmDeducedPaths(IReadOnlyList<(string File, string ArchivePath)> outside)
+        {
+            var lines = outside.Select(p => $"{Path.GetFileName(p.File)}  ->  {p.ArchivePath}").ToList();
+
+            return MessageBox.Show(this,
+                $"{outside.Count} file{(outside.Count == 1 ? " is" : "s are")} outside the Game Path, so the internal path " +
+                "was deduced from the folder names:\n\n" + Sample(lines) +
+                "\n\nAdd them with these paths?",
+                "Check the internal paths", MessageBoxButtons.YesNo, MessageBoxIcon.Question) == DialogResult.Yes;
         }
 
         private void DeleteSelected()
@@ -758,13 +835,17 @@ namespace PakRatModern.App
         private void SaveTo(string path)
         {
             if (!BeginBusy()) return;
+
+            var reload = false;
             try
             {
                 SetStatusImmediate("Saving...");
-                _document.Save(path, _settings.BackupBeforeInPlaceSave);
-                _pathBox.Text = _document.Path;
-                UpdateTitle();
-                SetStatus($"Saved: {path}");
+                if (TrySave(path, out reload))
+                {
+                    _pathBox.Text = _document.Path;
+                    UpdateTitle();
+                    SetStatus($"Saved: {path}");
+                }
             }
             catch (Exception ex)
             {
@@ -775,6 +856,79 @@ namespace PakRatModern.App
             {
                 EndBusy();
             }
+
+            if (reload) ReloadFromDisk();
+        }
+
+        /// <summary>
+        /// Guarda. Si el BSP cambio en disco desde que se abrio (una
+        /// recompilacion desde Hammer), pregunta antes de pisarlo: el documento
+        /// tiene la version vieja completa, geometria incluida.
+        /// </summary>
+        private bool TrySave(string path, out bool reload)
+        {
+            reload = false;
+            try
+            {
+                _document.Save(path, _settings.BackupBeforeInPlaceSave);
+                return true;
+            }
+            catch (FileChangedOnDiskException)
+            {
+                var answer = MessageBox.Show(this,
+                    $"{Path.GetFileName(path)} changed on disk after it was opened here (for example, it was recompiled).\n\n" +
+                    "Saving now would replace it with the older version loaded in PakRat Modern.\n\n" +
+                    "Yes: reload the BSP from disk (changes made here since opening are lost).\n" +
+                    "No: overwrite it anyway.\n" +
+                    "Cancel: do nothing.",
+                    "BSP changed on disk", MessageBoxButtons.YesNoCancel, MessageBoxIcon.Warning);
+
+                if (answer == DialogResult.No)
+                {
+                    _document.Save(path, _settings.BackupBeforeInPlaceSave, overwriteChangedFile: true);
+                    return true;
+                }
+
+                reload = answer == DialogResult.Yes;
+                SetStatus(reload ? "Save cancelled: reloading the BSP from disk" : "Save cancelled");
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// Al volver a la ventana, si el BSP cambio en disco, se ofrece recargarlo
+        /// antes de que Scan, Auto o Save trabajen sobre la version vieja. Si el
+        /// usuario dice que no, no se vuelve a preguntar por ese mismo cambio;
+        /// guardar encima igual pide confirmacion.
+        /// </summary>
+        private void CheckDiskChanges()
+        {
+            if (_document == null || _busy || _checkingDisk) return;
+
+            _checkingDisk = true;
+            try
+            {
+                if (!_document.HasChangedOnDisk(out var current)) return;
+                if (current.HasValue && _dismissedDiskChange.HasValue && current.Value.Equals(_dismissedDiskChange.Value)) return;
+
+                var answer = MessageBox.Show(this,
+                    $"{Path.GetFileName(_document.Path)} changed on disk after it was opened here (for example, it was recompiled).\n\n" +
+                    "Reload it now?" + (_document.IsDirty ? " Changes made here since opening will be lost." : string.Empty),
+                    "BSP changed on disk", MessageBoxButtons.YesNo, MessageBoxIcon.Question);
+
+                if (answer == DialogResult.Yes) ReloadFromDisk();
+                else _dismissedDiskChange = current;
+            }
+            finally
+            {
+                _checkingDisk = false;
+            }
+        }
+
+        private void ReloadFromDisk()
+        {
+            if (_document == null) return;
+            OpenBsp(_document.Path, confirmDiscard: false);
         }
 
         /// <summary>

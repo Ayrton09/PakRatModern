@@ -1,25 +1,60 @@
 using System;
 using System.Collections.Generic;
+using System.IO;
 using System.Linq;
+using System.Text;
 
 namespace PakRatModern.Core
 {
+    /// <summary>Una entrada tal como la describe el directorio central del ZIP.</summary>
+    public sealed class ZipCentralEntry
+    {
+        public byte[] NameBytes { get; internal set; }
+        public ushort Flags { get; internal set; }
+        public ushort Method { get; internal set; }
+        public uint Crc { get; internal set; }
+        public long CompressedSize { get; internal set; }
+        public long UncompressedSize { get; internal set; }
+
+        /// <summary>Offset de la cabecera local, ya corregido si el ZIP trae datos delante.</summary>
+        public long LocalHeaderOffset { get; internal set; }
+
+        /// <summary>Bit 11: el nombre esta en UTF-8.</summary>
+        public bool IsUtf8 => (Flags & 0x0800) != 0;
+
+        public bool IsEncrypted => (Flags & 0x0001) != 0;
+
+        /// <summary>
+        /// Nombre decodificado. Sin el flag UTF-8 se lee como Latin-1, que
+        /// conserva cada byte tal cual: vbsp y bspzip guardan los bytes crudos
+        /// del sistema del mapper y el motor busca esos mismos bytes.
+        /// </summary>
+        public string Name => (IsUtf8 ? Encoding.UTF8 : ZipInspector.Latin1).GetString(NameBytes);
+
+        public bool IsDirectory => NameBytes.Length > 0 && NameBytes[NameBytes.Length - 1] == (byte)'/';
+    }
+
     /// <summary>
-    /// Lector minimo del directorio central de un ZIP, solo para conocer con que
-    /// metodo esta comprimida cada entrada.
+    /// Lector del directorio central de un ZIP.
     ///
-    /// Hace falta porque ZipArchive de .NET no expone el metodo y falla con un
-    /// mensaje generico cuando no lo soporta: sin esto no se puede decirle al
-    /// usuario que le pasa a su mapa.
+    /// El PAK se lee a mano en lugar de con ZipArchive: el de .NET Framework no
+    /// verifica el CRC, no expone el metodo ni los flags de cada entrada,
+    /// decodifica los nombres con la pagina de codigos del sistema y no sabe
+    /// descomprimir LZMA, que es lo que usan los mapas comprimidos con bspzip.
     /// </summary>
     public static class ZipInspector
     {
         private const uint EndOfCentralDirectorySignature = 0x06054b50;
         private const uint CentralFileHeaderSignature = 0x02014b50;
+        private const uint Zip64LocatorSignature = 0x07064b50;
 
-        // Lo unico que ZipArchive sabe descomprimir.
-        private const ushort MethodStored = 0;
-        private const ushort MethodDeflate = 8;
+        public const ushort MethodStored = 0;
+        public const ushort MethodDeflate = 8;
+        public const ushort MethodBZip2 = 12;
+        public const ushort MethodLzma = 14;
+
+        /// <summary>Codificacion que conserva los bytes 0-255 uno a uno.</summary>
+        public static readonly Encoding Latin1 = Encoding.GetEncoding(28591);
 
         private static readonly Dictionary<ushort, string> MethodNames = new Dictionary<ushort, string>
         {
@@ -32,36 +67,95 @@ namespace PakRatModern.Core
             [98] = "PPMd",
         };
 
-        /// <summary>Cantidad de entradas por metodo de compresion.</summary>
-        public static Dictionary<ushort, int> GetCompressionMethods(byte[] zipBytes)
+        /// <summary>Metodos que este lector descomprime.</summary>
+        public static bool IsReadable(ushort method) =>
+            method == MethodStored || method == MethodDeflate || method == MethodLzma;
+
+        /// <summary>
+        /// Lee el directorio central. Lanza <see cref="InvalidDataException"/> si la
+        /// estructura no es coherente y <see cref="NotSupportedException"/> para
+        /// Zip64 o ZIP multivolumen, que ninguna herramienta de Source escribe.
+        /// </summary>
+        public static IReadOnlyList<ZipCentralEntry> ReadCentralDirectory(byte[] zip)
         {
-            var counts = new Dictionary<ushort, int>();
-            if (zipBytes == null || zipBytes.Length < 22) return counts;
+            if (zip == null || zip.Length < 22)
+                throw new InvalidDataException("PAK is too small to be a ZIP archive.");
 
-            var eocd = FindEndOfCentralDirectory(zipBytes);
-            if (eocd < 0) return counts;
+            var eocd = FindEndOfCentralDirectory(zip);
+            if (eocd < 0)
+                throw new InvalidDataException("PAK has no ZIP end of central directory record.");
 
-            var entryCount = BitConverter.ToUInt16(zipBytes, eocd + 10);
+            var diskNumber = BitConverter.ToUInt16(zip, eocd + 4);
+            var centralDisk = BitConverter.ToUInt16(zip, eocd + 6);
+            var entryCount = BitConverter.ToUInt16(zip, eocd + 10);
+            long centralSize = BitConverter.ToUInt32(zip, eocd + 12);
+            long centralOffset = BitConverter.ToUInt32(zip, eocd + 16);
 
-            // Aritmetica en long: un offset cercano a uint.MaxValue desbordaba
-            // el int y pasaba el chequeo de rango con un valor negativo.
-            long offset = BitConverter.ToUInt32(zipBytes, eocd + 16);
+            if (eocd >= 20 && BitConverter.ToUInt32(zip, eocd - 20) == Zip64LocatorSignature)
+                throw new NotSupportedException("This map's PAK is a Zip64 archive, which Source tools never write; it is refused.");
+
+            if (diskNumber != 0 || centralDisk != 0)
+                throw new NotSupportedException("This map's PAK is a multi-volume ZIP archive; it is refused.");
+
+            // Igual que zipfile de Python: si el ZIP trae datos delante, todos los
+            // offsets quedan corridos en la misma cantidad.
+            var concat = eocd - centralSize - centralOffset;
+            if (concat < 0)
+                throw new InvalidDataException("PAK central directory is out of range.");
+
+            var entries = new List<ZipCentralEntry>(entryCount);
+            var pos = centralOffset + concat;
+            var end = eocd;
 
             for (var i = 0; i < entryCount; i++)
             {
-                if (offset < 0 || offset + 46 > zipBytes.Length) break;
-                var at = (int)offset;
-                if (BitConverter.ToUInt32(zipBytes, at) != CentralFileHeaderSignature) break;
+                if (pos + 46 > end || BitConverter.ToUInt32(zip, (int)pos) != CentralFileHeaderSignature)
+                    throw new InvalidDataException($"PAK central directory entry {i} is damaged.");
 
-                var method = BitConverter.ToUInt16(zipBytes, at + 10);
-                counts[method] = counts.TryGetValue(method, out var n) ? n + 1 : 1;
+                var at = (int)pos;
+                var nameLength = BitConverter.ToUInt16(zip, at + 28);
+                var extraLength = BitConverter.ToUInt16(zip, at + 30);
+                var commentLength = BitConverter.ToUInt16(zip, at + 32);
+                var next = pos + 46 + nameLength + extraLength + commentLength;
+                if (next > end)
+                    throw new InvalidDataException($"PAK central directory entry {i} is damaged.");
 
-                var nameLength = BitConverter.ToUInt16(zipBytes, at + 28);
-                var extraLength = BitConverter.ToUInt16(zipBytes, at + 30);
-                var commentLength = BitConverter.ToUInt16(zipBytes, at + 32);
-                offset += 46 + nameLength + extraLength + commentLength;
+                var compressed = BitConverter.ToUInt32(zip, at + 20);
+                var uncompressed = BitConverter.ToUInt32(zip, at + 24);
+                var localOffset = BitConverter.ToUInt32(zip, at + 42);
+                if (compressed == uint.MaxValue || uncompressed == uint.MaxValue || localOffset == uint.MaxValue)
+                    throw new NotSupportedException("This map's PAK uses Zip64 entries, which Source tools never write; it is refused.");
+
+                var name = new byte[nameLength];
+                Array.Copy(zip, at + 46, name, 0, nameLength);
+
+                entries.Add(new ZipCentralEntry
+                {
+                    NameBytes = name,
+                    Flags = BitConverter.ToUInt16(zip, at + 8),
+                    Method = BitConverter.ToUInt16(zip, at + 10),
+                    Crc = BitConverter.ToUInt32(zip, at + 16),
+                    CompressedSize = compressed,
+                    UncompressedSize = uncompressed,
+                    LocalHeaderOffset = localOffset + concat,
+                });
+
+                pos = next;
             }
 
+            return entries;
+        }
+
+        /// <summary>Cantidad de entradas por metodo de compresion. Vacio si el ZIP no se puede leer.</summary>
+        public static Dictionary<ushort, int> GetCompressionMethods(byte[] zipBytes)
+        {
+            var counts = new Dictionary<ushort, int>();
+            IReadOnlyList<ZipCentralEntry> entries;
+            try { entries = ReadCentralDirectory(zipBytes); }
+            catch (Exception ex) when (ex is InvalidDataException || ex is NotSupportedException) { return counts; }
+
+            foreach (var entry in entries)
+                counts[entry.Method] = counts.TryGetValue(entry.Method, out var n) ? n + 1 : 1;
             return counts;
         }
 
@@ -71,25 +165,47 @@ namespace PakRatModern.Core
         /// </summary>
         public static string DescribeUnsupported(byte[] zipBytes)
         {
-            var counts = GetCompressionMethods(zipBytes);
+            IReadOnlyList<ZipCentralEntry> entries;
+            try { entries = ReadCentralDirectory(zipBytes); }
+            catch (Exception ex) when (ex is InvalidDataException || ex is NotSupportedException) { return null; }
+            return DescribeUnsupported(entries);
+        }
 
-            var unsupported = counts
-                .Where(kv => kv.Key != MethodStored && kv.Key != MethodDeflate)
-                .OrderByDescending(kv => kv.Value)
+        public static string DescribeUnsupported(IReadOnlyList<ZipCentralEntry> entries)
+        {
+            var files = entries.Where(e => !e.IsDirectory).ToList();
+
+            var encrypted = files.Count(e => e.IsEncrypted);
+            if (encrypted > 0)
+                return $"This map's PAK has {encrypted} encrypted entr{(encrypted == 1 ? "y" : "ies")} (out of {files.Count}). " +
+                       "Source cannot load encrypted files and they cannot be read here, so the map is refused.";
+
+            var unsupported = files
+                .Where(e => !IsReadable(e.Method))
+                .GroupBy(e => e.Method)
+                .OrderByDescending(g => g.Count())
                 .ToList();
 
             if (unsupported.Count == 0) return null;
 
-            var detail = string.Join(", ", unsupported.Select(kv =>
-                $"{kv.Value} x {(MethodNames.TryGetValue(kv.Key, out var name) ? name : $"method {kv.Key}")}"));
+            var detail = string.Join(", ", unsupported.Select(g =>
+                $"{g.Count()} x {(MethodNames.TryGetValue(g.Key, out var name) ? name : $"method {g.Key}")}"));
 
-            var total = counts.Values.Sum();
+            var message = $"This map's PAK uses a compression method that cannot be read here ({detail}, out of {files.Count} entries).\n\n" +
+                          "Opening it partially would silently drop those files when saving, so it is refused.";
 
-            return $"This map's PAK uses a compression method that cannot be read here ({detail}, out of {total} entries).\n\n" +
-                   "Opening it partially would silently drop those files when saving, so it is refused.\n\n" +
-                   "The command line tool can read them. To convert the map so it opens here, run:\n" +
-                   "    pakrat_modern.ps1 add <map.bsp> <any file> --base <its folder> --inplace\n" +
-                   "which rewrites every entry uncompressed.";
+            // BZip2 lo lee el zipfile de Python; los demas no los lee ninguna de las dos herramientas.
+            if (unsupported.All(g => g.Key == MethodBZip2))
+            {
+                return message + "\n\n" +
+                       "The command line tool can read BZip2 (it needs Python 3.8 or later). To convert the map so it opens here, run:\n" +
+                       "    pakrat_modern.ps1 repack <map.bsp> --inplace\n" +
+                       "which rewrites every entry uncompressed without adding or removing anything.";
+            }
+
+            return message + "\n\n" +
+                   "The command line tool cannot read them either. Repack the map with the tool that created it " +
+                   "(for example bspzip -repack) and open it again.";
         }
 
         /// <summary>Busca el EOCD hacia atras, tolerando comentario final.</summary>

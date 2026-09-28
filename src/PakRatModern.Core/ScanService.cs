@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Text;
+using System.Text.RegularExpressions;
 
 namespace PakRatModern.Core
 {
@@ -68,6 +69,22 @@ namespace PakRatModern.Core
         // patologica no deberia colgar la interfaz.
         private const int MaxExpansionIterations = 20000;
 
+        private static readonly char[] InvalidPathChars = Path.GetInvalidPathChars();
+
+        private static readonly Regex ManifestFilePattern =
+            new Regex(@"""?file""?\s+""([^""]+)""", RegexOptions.Compiled | RegexOptions.IgnoreCase);
+
+        private static readonly Regex WavePattern =
+            new Regex(@"""?wave""?\s+""([^""]+)""", RegexOptions.Compiled | RegexOptions.IgnoreCase);
+
+        private static readonly Regex SoundFilePattern =
+            new Regex(@"\.(wav|mp3|ogg)$", RegexOptions.Compiled | RegexOptions.IgnoreCase);
+
+        private static readonly Regex ParticleAssetPattern =
+            new Regex(@"[A-Za-z0-9_\-/\\\.]+\.(vmt|mdl)", RegexOptions.Compiled | RegexOptions.IgnoreCase);
+
+        private static readonly char[] SoundPrefixChars = "*#@^)(<>!?$}&~`+%".ToCharArray();
+
         private readonly IReadOnlyDictionary<string, PakEntry> _pakEntries;
         private readonly string _gameRoot;
 
@@ -92,14 +109,25 @@ namespace PakRatModern.Core
             Report("Scan: reading BSP references...");
             var refs = BspReferenceScanner.Collect(bsp, mapName, includeExtras);
 
+            Report("Scan: following particle manifests and soundscapes...");
+            ExpandScripts(refs);
+
             Report("Scan: expanding model materials...");
-            ExpandModelMaterials(refs);
+            var unresolvedMaterials = ExpandModelMaterials(refs);
 
             Report("Scan: expanding material dependencies...");
             ExpandVmtDependencies(refs);
 
             Report("Scan: checking base game VPKs...");
-            var baseIndex = BaseGameIndex.Build(_gameRoot, refs);
+            var needed = new HashSet<string>(refs, StringComparer.OrdinalIgnoreCase);
+            foreach (var candidates in unresolvedMaterials) needed.UnionWith(candidates);
+            var baseIndex = BaseGameIndex.Build(_gameRoot, needed);
+
+            // Texturas de modelo que no estan ni en el PAK ni en disco: si el juego
+            // trae alguna de sus rutas, esa es la que carga el motor; si no, se
+            // reporta solo la primera, que es la que el motor busca primero.
+            foreach (var candidates in unresolvedMaterials)
+                refs.Add(candidates.FirstOrDefault(baseIndex.Contains) ?? candidates[0]);
 
             Report("Scan: checking disk files...");
             var optionalExtras = includeExtras && !string.IsNullOrWhiteSpace(mapName)
@@ -115,9 +143,12 @@ namespace PakRatModern.Core
                 var exists = found != null;
                 var fullPath = found ?? ToDiskPath(reference);
 
-                // Los extras son archivos opcionales por convencion de nombre; si
-                // no existen ni estan en el PAK, no son un problema que reportar.
-                if (!exists && !inPak && optionalExtras.Contains(reference)) continue;
+                // Los extras y los archivos opcionales del modelo (.phy, .dx80.vtx,
+                // .sw.vtx) pueden no existir sin que nada se rompa; si no estan ni
+                // en disco ni en el PAK, no son un problema que reportar.
+                if (!exists && !inPak &&
+                    (optionalExtras.Contains(reference) || GameReference.IsOptionalModelCompanion(reference)))
+                    continue;
 
                 var baseGame = !inPak && baseIndex.Contains(reference);
 
@@ -153,9 +184,15 @@ namespace PakRatModern.Core
             return summary;
         }
 
-        /// <summary>Cada .mdl aporta los materiales que declara internamente.</summary>
-        private void ExpandModelMaterials(ISet<string> refs)
+        /// <summary>
+        /// Cada .mdl aporta los materiales que declara. Con varios
+        /// <c>$cdmaterials</c> el motor usa la primera ruta que existe, asi que se
+        /// agrega esa; las texturas que no aparecen en ninguna se devuelven para
+        /// decidir despues, con el indice de los VPK del juego.
+        /// </summary>
+        private List<IReadOnlyList<string>> ExpandModelMaterials(ISet<string> refs)
         {
+            var unresolved = new List<IReadOnlyList<string>>();
             var models = refs.Where(r => r.EndsWith(".mdl", StringComparison.OrdinalIgnoreCase)).ToList();
 
             foreach (var model in models)
@@ -163,10 +200,76 @@ namespace PakRatModern.Core
                 var bytes = ReadBinary(model);
                 if (bytes == null) continue;
 
-                foreach (var material in MdlReader.GetMaterialRefs(bytes))
-                    refs.Add(material);
+                foreach (var candidates in MdlReader.GetMaterialCandidates(bytes))
+                {
+                    var present = candidates.FirstOrDefault(c =>
+                        refs.Contains(c) || _pakEntries.ContainsKey(c) || FindOnDisk(c) != null);
+
+                    if (present != null) refs.Add(present);
+                    else if (candidates.Count == 1) refs.Add(candidates[0]);
+                    else unresolved.Add(candidates);
+                }
+            }
+
+            return unresolved;
+        }
+
+        /// <summary>
+        /// Archivos de texto que nombran otros archivos: el manifiesto de
+        /// particulas lista los .pcf, cada .pcf nombra los materiales de sus
+        /// sistemas, y los soundscapes y sonidos del nivel nombran .wav. Empaquetar
+        /// el manifiesto sin lo que lista deja el mapa sin particulas ni sonido.
+        /// </summary>
+        private void ExpandScripts(ISet<string> refs)
+        {
+            foreach (var manifest in refs.Where(IsParticleManifest).ToList())
+            {
+                var text = ReadText(manifest);
+                if (text == null) continue;
+
+                // "!" al principio solo pide precarga; el archivo es el mismo.
+                foreach (Match m in ManifestFilePattern.Matches(text))
+                    GameReference.AddRef(refs, m.Groups[1].Value.TrimStart('!'));
+            }
+
+            foreach (var pcf in refs.Where(r => r.EndsWith(".pcf", StringComparison.OrdinalIgnoreCase)).ToList())
+            {
+                var bytes = ReadBinary(pcf);
+                if (bytes == null) continue;
+
+                // Los .pcf suelen ser DMX binario: se buscan las cadenas con extension.
+                foreach (Match m in ParticleAssetPattern.Matches(ZipInspector.Latin1.GetString(bytes)))
+                {
+                    if (m.Value.EndsWith(".mdl", StringComparison.OrdinalIgnoreCase))
+                        GameReference.AddModelWithCompanions(refs, m.Value);
+                    else
+                        GameReference.AddMaterialReference(refs, m.Value);
+                }
+            }
+
+            foreach (var script in refs.Where(IsSoundScript).ToList())
+            {
+                var text = ReadText(script);
+                if (text == null) continue;
+
+                foreach (Match m in WavePattern.Matches(text))
+                {
+                    // Los prefijos (*, #, ^, ) ...) son modificadores del motor, no parte del nombre.
+                    var wave = m.Groups[1].Value.Trim().TrimStart(SoundPrefixChars);
+                    if (SoundFilePattern.IsMatch(wave)) GameReference.AddRef(refs, wave);
+                }
             }
         }
+
+        private static bool IsParticleManifest(string path) =>
+            path.StartsWith("maps/", StringComparison.OrdinalIgnoreCase) &&
+            path.EndsWith("_particles.txt", StringComparison.OrdinalIgnoreCase);
+
+        private static bool IsSoundScript(string path) =>
+            (path.StartsWith("scripts/soundscapes", StringComparison.OrdinalIgnoreCase) &&
+             path.EndsWith(".txt", StringComparison.OrdinalIgnoreCase)) ||
+            (path.StartsWith("maps/", StringComparison.OrdinalIgnoreCase) &&
+             path.EndsWith("_level_sounds.txt", StringComparison.OrdinalIgnoreCase));
 
         /// <summary>
         /// Recorre los .vmt en anchura: cada material puede incluir otros y pedir
@@ -212,9 +315,16 @@ namespace PakRatModern.Core
         /// <summary>Ruta donde iria el archivo en el Game Path, exista o no.</summary>
         private string ToDiskPath(string archivePath)
         {
-            if (string.IsNullOrWhiteSpace(_gameRoot)) return string.Empty;
+            if (string.IsNullOrWhiteSpace(_gameRoot) || !IsValidPath(archivePath)) return string.Empty;
             return Path.Combine(_gameRoot, archivePath.Replace('/', Path.DirectorySeparatorChar));
         }
+
+        /// <summary>
+        /// Una referencia con | &lt; &gt; o caracteres de control no puede existir en
+        /// disco, y Path.Combine lanza con ella: sin este filtro, una sola
+        /// referencia rara en el BSP abortaba el scan entero.
+        /// </summary>
+        private static bool IsValidPath(string archivePath) => archivePath.IndexOfAny(InvalidPathChars) < 0;
 
         /// <summary>
         /// Primera ruta existente en disco para la referencia, recorriendo los
@@ -222,6 +332,7 @@ namespace PakRatModern.Core
         /// </summary>
         private string FindOnDisk(string archivePath)
         {
+            if (!IsValidPath(archivePath)) return null;
             var relative = archivePath.Replace('/', Path.DirectorySeparatorChar);
             foreach (var dir in _searchDirs)
             {

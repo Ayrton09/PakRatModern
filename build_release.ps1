@@ -61,8 +61,7 @@ if (-not $appVersion) { throw "Could not read Version from $appProject" }
 if (-not $SkipTests) {
     Write-Host 'Running test suite...' -ForegroundColor Cyan
 
-    # El proyecto de pruebas apunta a varios frameworks (Windows y multiplataforma),
-    # asi que hay que elegir uno explicitamente: aca se usa el mismo que la aplicacion.
+    # Las pruebas corren sobre el mismo framework que la aplicacion.
     & dotnet run --project $testProject -c Release -f $appTargetFramework -v q --nologo
     if ($LASTEXITCODE -ne 0) {
         throw "Test suite failed with exit code $LASTEXITCODE. Release aborted."
@@ -85,7 +84,9 @@ if (-not $SkipTests) {
 Write-Host 'Publishing application...' -ForegroundColor Cyan
 $publishDir = Join-Path $projectRoot "src\PakRatModern.App\bin\Release\$appTargetFramework\publish"
 
-& dotnet publish $appProject -c Release -f $appTargetFramework -v q --nologo
+# ContinuousIntegrationBuild: el exe y el DLL guardan /_/src/... en lugar de la
+# ruta local del disco de quien compila (que incluia el nombre de usuario).
+& dotnet publish $appProject -c Release -f $appTargetFramework -v q --nologo -p:ContinuousIntegrationBuild=true
 if ($LASTEXITCODE -ne 0) {
     throw "Build failed with exit code $LASTEXITCODE."
 }
@@ -137,15 +138,9 @@ if (Test-Path -LiteralPath $notesPath -PathType Leaf) {
     Write-Warning "No release notes found for $appVersion ($notesPath)"
 }
 
-# Acceso directo
-$shortcutPath = Join-Path $resolvedReleaseRoot 'PakRat Modern.lnk'
-$wshell = New-Object -ComObject WScript.Shell
-$shortcut = $wshell.CreateShortcut($shortcutPath)
-$shortcut.TargetPath = Join-Path $resolvedReleaseRoot 'PakRatModern.exe'
-$shortcut.WorkingDirectory = $resolvedReleaseRoot
-$shortcut.IconLocation = Join-Path $resolvedReleaseRoot 'pakrat_modern.ico'
-$shortcut.Description = 'Launch PakRat Modern'
-$shortcut.Save()
+# Sin acceso directo: un .lnk guarda rutas absolutas y el nombre del equipo de
+# quien compila, y en esta PC abria la copia de release\ en lugar de la extraida.
+# Ademas, un .lnk dentro de un zip es algo que filtros de correo y antivirus miran mal.
 
 if (Test-Path -LiteralPath $resolvedZipPath) {
     Remove-Item -LiteralPath $resolvedZipPath -Force
@@ -158,7 +153,12 @@ Compress-Archive -Path (Join-Path $resolvedReleaseRoot '*') -DestinationPath $re
 
 Write-Host ''
 Write-Host 'SHA256:' -ForegroundColor Cyan
-foreach ($target in @((Join-Path $resolvedReleaseRoot 'PakRatModern.exe'), $resolvedZipPath)) {
+$hashTargets = @(
+    $resolvedZipPath,
+    (Join-Path $resolvedReleaseRoot 'PakRatModern.exe'),
+    (Join-Path $resolvedReleaseRoot 'PakRatModern.Core.dll')
+)
+foreach ($target in $hashTargets) {
     $hash = (Get-FileHash -LiteralPath $target -Algorithm SHA256).Hash.ToLowerInvariant()
     Write-Host ("  {0}  {1}" -f $hash, [System.IO.Path]::GetFileName($target))
 }

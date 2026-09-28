@@ -1,0 +1,5 @@
+# Fixtures y recursos binarios: sin conversion de fin de linea ni diff de texto.
+*.lzma binary
+*.zip binary
+*.png binary
+*.ico binary

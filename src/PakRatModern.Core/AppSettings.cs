@@ -85,7 +85,10 @@ namespace PakRatModern.Core
             {
                 var serializer = new DataContractJsonSerializer(typeof(AppSettings));
                 serializer.WriteObject(ms, this);
-                File.WriteAllText(AppPaths.SettingsPath, Encoding.UTF8.GetString(ms.ToArray()), new UTF8Encoding(false));
+
+                // Atomico: un corte a mitad dejaba el JSON truncado y al arrancar
+                // se perdian todas las rutas guardadas.
+                AtomicFile.WriteAllBytes(AppPaths.SettingsPath, ms.ToArray());
             }
         }
 

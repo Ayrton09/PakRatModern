@@ -90,6 +90,9 @@ namespace PakRatModern.Core
             if (NumberPattern.IsMatch(candidate)) return;
             if (KeywordPattern.IsMatch(candidate)) return;
 
+            // "$reflecttexture" "_rt_WaterReflection" y similares: los crea el motor.
+            if (GameReference.IsRenderTarget(candidate)) return;
+
             if (!candidate.EndsWith(extension, StringComparison.OrdinalIgnoreCase))
                 candidate += extension;
 

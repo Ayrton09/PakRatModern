@@ -18,6 +18,9 @@
     <None Include="..\testdata\reference-pak.sha256"
           Link="testdata\reference-pak.sha256"
           CopyToOutputDirectory="PreserveNewest" />
+    <None Include="..\testdata\lzma\*"
+          Link="testdata\lzma\%(Filename)%(Extension)"
+          CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 
   <ItemGroup>

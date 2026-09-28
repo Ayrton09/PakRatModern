@@ -91,7 +91,16 @@ namespace PakRatModern.Core
 
             var ext = GetExtension(candidate);
             if (ext.Length == 0 || ext == ".mdl")
+            {
                 AddModelWithCompanions(set, candidate);
+            }
+            else if (ext == ".vmt" || ext == ".spr")
+            {
+                // env_sprite y env_glow guardan su material en "model":
+                // "sprites/glow01.vmt", o "sprites/glow01.spr" al estilo HL1,
+                // que el motor resuelve a materials/sprites/glow01.vmt.
+                AddMaterialReference(set, candidate);
+            }
         }
 
         /// <summary>
@@ -107,7 +116,7 @@ namespace PakRatModern.Core
                 return null;
 
             var ext = GetExtension(candidate);
-            if (ext == ".vtf") candidate = candidate.Substring(0, candidate.Length - 4) + ".vmt";
+            if (ext == ".vtf" || ext == ".spr") candidate = candidate.Substring(0, candidate.Length - 4) + ".vmt";
             else if (ext != ".vmt") candidate += ".vmt";
 
             var reference = Normalize(candidate);
@@ -123,8 +132,49 @@ namespace PakRatModern.Core
         }
 
         /// <summary>
+        /// Una textura suelta, no un material: <c>env_projectedtexture</c> carga
+        /// su "texturename" directamente como .vtf.
+        /// </summary>
+        public static void AddTextureReference(ISet<string> set, string value)
+        {
+            if (string.IsNullOrWhiteSpace(value)) return;
+
+            var candidate = value.Trim().Trim('"').Replace('\\', '/').Trim('/');
+            if (string.IsNullOrWhiteSpace(candidate) || candidate.Contains("..") || candidate.Contains(":")) return;
+            if (IsRenderTarget(candidate)) return;
+
+            if (GetExtension(candidate) != ".vtf") candidate += ".vtf";
+            set.Add(EnsurePrefix(candidate, "materials/"));
+        }
+
+        /// <summary>
+        /// Los nombres <c>_rt_*</c> son render targets que crea el motor
+        /// (reflejo del agua, camaras, pantalla completa), no archivos.
+        /// </summary>
+        public static bool IsRenderTarget(string value)
+        {
+            if (string.IsNullOrWhiteSpace(value)) return false;
+            var name = value.Trim().Trim('"').Replace('\\', '/');
+            var slash = name.LastIndexOf('/');
+            return name.Substring(slash + 1).StartsWith("_rt_", StringComparison.OrdinalIgnoreCase);
+        }
+
+        /// <summary>
+        /// Archivos del modelo que pueden no existir sin que nada se rompa: el
+        /// .phy solo esta si el modelo tiene colision, y .dx80/.sw solo los
+        /// generan los compiladores viejos. Si faltan no se reportan.
+        /// </summary>
+        public static bool IsOptionalModelCompanion(string archivePath)
+        {
+            return archivePath.EndsWith(".phy", StringComparison.OrdinalIgnoreCase)
+                || archivePath.EndsWith(".dx80.vtx", StringComparison.OrdinalIgnoreCase)
+                || archivePath.EndsWith(".sw.vtx", StringComparison.OrdinalIgnoreCase);
+        }
+
+        /// <summary>
         /// Combina el directorio de texturas declarado por un modelo con el nombre
-        /// de textura. Un nombre que ya trae carpeta se toma tal cual.
+        /// de textura, como hace el motor: siempre directorio + nombre, aunque el
+        /// nombre traiga subcarpetas.
         /// </summary>
         public static string JoinModelMaterialPath(string directory, string textureName)
         {
@@ -135,7 +185,6 @@ namespace PakRatModern.Core
                 return null;
 
             if (texture.StartsWith("materials/", StringComparison.OrdinalIgnoreCase)) return texture;
-            if (texture.Contains("/")) return texture;
 
             var dir = string.Empty;
             if (!string.IsNullOrWhiteSpace(directory))
@@ -159,6 +208,11 @@ namespace PakRatModern.Core
             return path.Substring(dot).ToLowerInvariant();
         }
 
+        /// <summary>
+        /// Cadena terminada en cero. Se lee como Latin-1, igual que los nombres
+        /// del PAK: Hammer escribe los bytes del sistema del mapper y el motor
+        /// los compara crudos, asi que un "é" tiene que seguir siendo el mismo byte.
+        /// </summary>
         internal static string ReadNullTerminated(byte[] bytes, int offset)
         {
             if (bytes == null || offset < 0 || offset >= bytes.Length) return string.Empty;
@@ -167,7 +221,7 @@ namespace PakRatModern.Core
             while (end < bytes.Length && bytes[end] != 0) end++;
             if (end <= offset) return string.Empty;
 
-            return System.Text.Encoding.ASCII.GetString(bytes, offset, end - offset);
+            return ZipInspector.Latin1.GetString(bytes, offset, end - offset);
         }
 
         internal static int? ReadInt32Safe(byte[] bytes, int offset)

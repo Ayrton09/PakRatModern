@@ -41,6 +41,7 @@ namespace PakRatModern.Tests
             ScanServiceTests.Run(Check);
             DocumentTests.Run(Check);
             RegressionTests.Run(Check);
+            LzmaTests.Run(Check);
 
             if (Failures.Count == 0)
             {
@@ -119,9 +120,10 @@ namespace PakRatModern.Tests
         }
 
         /// <summary>
-        /// Hay mapas publicados con el PAK entero en LZMA, que ZipArchive no
-        /// descomprime. Abrirlos a medias haria que guardar borrara esas entradas,
-        /// asi que debe rechazarse con un mensaje que diga que pasa.
+        /// Un PAK con metodos que no se pueden descomprimir se rechaza entero:
+        /// abrirlo a medias haria que guardar borrara esas entradas. El mensaje
+        /// tiene que nombrar el metodo y decir que hacer. LZMA ya no esta en
+        /// esta lista: lo lee el core (ver LzmaTests).
         /// </summary>
         private static void TestUnsupportedCompressionIsDetected()
         {
@@ -133,22 +135,33 @@ namespace PakRatModern.Tests
             Check(ZipInspector.DescribeUnsupported(pak) == null,
                 "inspector: marco como no soportado un PAK valido");
 
-            // Se simula LZMA cambiando el metodo en el directorio central
-            var eocd = pak.Length - 22;
-            var centralOffset = (int)BitConverter.ToUInt32(pak, eocd + 16);
-            var patched = (byte[])pak.Clone();
-            patched[centralOffset + 10] = 14;   // metodo LZMA
-            patched[centralOffset + 11] = 0;
-
-            var described = ZipInspector.DescribeUnsupported(patched);
-            Check(described != null, "inspector: no detecto el metodo no soportado");
-            Check(described != null && described.Contains("LZMA"),
-                $"inspector: el mensaje no nombra el metodo -> {described}");
+            // BZip2 lo lee la CLI: el mensaje propone repack.
+            var bzip2 = PatchFirstMethod(pak, 12);
+            var described = ZipInspector.DescribeUnsupported(bzip2);
+            Check(described != null && described.Contains("BZip2"),
+                $"inspector: el mensaje no nombra BZip2 -> {described}");
+            Check(described != null && described.Contains("repack") && !described.Contains("any file"),
+                $"inspector: el mensaje deberia proponer repack, no agregar un archivo -> {described}");
 
             var refused = false;
-            try { PakArchive.Read(patched); }
+            try { PakArchive.Read(bzip2); }
             catch (NotSupportedException) { refused = true; }
             Check(refused, "inspector: Read deberia rechazar el PAK, no abrirlo a medias");
+
+            // Deflate64 no lo lee ninguna de las dos herramientas: no se promete la CLI.
+            var deflate64 = ZipInspector.DescribeUnsupported(PatchFirstMethod(pak, 9));
+            Check(deflate64 != null && deflate64.Contains("Deflate64") && !deflate64.Contains("pakrat_modern.ps1"),
+                $"inspector: para Deflate64 no deberia sugerir la CLI -> {deflate64}");
+        }
+
+        /// <summary>Cambia el metodo de la primera entrada en el directorio central.</summary>
+        private static byte[] PatchFirstMethod(byte[] zip, ushort method)
+        {
+            var eocd = zip.Length - 22;
+            var centralOffset = (int)BitConverter.ToUInt32(zip, eocd + 16);
+            var patched = (byte[])zip.Clone();
+            BitConverter.GetBytes(method).CopyTo(patched, centralOffset + 10);
+            return patched;
         }
 
         /// <summary>ZIP crudo, sin pasar por la validacion de rutas.</summary>
@@ -249,6 +262,61 @@ namespace PakRatModern.Tests
                         == "sound/x.wav",
                     "ruta desde disco: fallo con el Game Path en otra capitalizacion");
             }
+
+            // Fuera del Game Path, carpetas del usuario que se llaman como una
+            // raiz ("maps", "Media", "Scripts") no pueden ganarle al contenido.
+            var docs = Path.GetFullPath(P("Users", "me", "Documents"));
+            Check(ArchivePath.FromDiskPath(P(docs, "maps", "mymap", "materials", "custom", "wall.vmt"), gameRoot)
+                    == "materials/custom/wall.vmt",
+                "ruta desde disco: una carpeta 'maps' del usuario decidio la ruta interna");
+            Check(ArchivePath.FromDiskPath(P(Path.GetFullPath("Media"), "Mapping", "materials", "x.vmt"), null)
+                    == "materials/x.vmt",
+                "ruta desde disco: una carpeta 'Media' del usuario decidio la ruta interna");
+            Check(ArchivePath.FromDiskPath(P(docs, "Scripts", "pack", "sound", "mymap", "alarm.wav"), gameRoot)
+                    == "sound/mymap/alarm.wav",
+                "ruta desde disco: una carpeta 'Scripts' del usuario decidio la ruta interna");
+
+            // Las raices que si se anidan de verdad se respetan
+            Check(ArchivePath.FromDiskPath(P(afuera, "materials", "models", "props", "x.vmt"), null)
+                    == "materials/models/props/x.vmt",
+                "ruta desde disco: materials/models se partio en models/");
+            Check(ArchivePath.FromDiskPath(P(afuera, "materials", "maps", "de_x", "c0_0_0.vtf"), null)
+                    == "materials/maps/de_x/c0_0_0.vtf",
+                "ruta desde disco: materials/maps se partio en maps/");
+
+            // Carpeta agregada entera: la ruta se ancla en ella
+            var mapFolder = P(docs, "maps", "mymap");
+            Check(ArchivePath.FromDiskPath(P(mapFolder, "materials", "a.vmt"), gameRoot, mapFolder) == "materials/a.vmt",
+                "ruta desde disco: no anclo en la carpeta de contenido agregada");
+            Check(ArchivePath.FromDiskPath(P(mapFolder, "notas.txt"), gameRoot, mapFolder) == null,
+                "ruta desde disco: un archivo suelto de la carpeta de contenido no deberia empaquetarse");
+            Check(ArchivePath.IsInside(P(gameRoot, "materials", "a.vmt"), gameRoot) &&
+                  !ArchivePath.IsInside(P(afuera, "materials", "a.vmt"), gameRoot),
+                "ruta desde disco: IsInside no distingue dentro y fuera del Game Path");
+
+            TestFindContentRoot();
+        }
+
+        private static void TestFindContentRoot()
+        {
+            var temp = Path.Combine(Path.GetTempPath(), "pakrat_content_" + Guid.NewGuid().ToString("N"));
+            try
+            {
+                var mapFolder = Path.Combine(temp, "maps", "mymap");
+                Directory.CreateDirectory(Path.Combine(mapFolder, "materials", "custom"));
+                Directory.CreateDirectory(Path.Combine(mapFolder, "models"));
+
+                Check(string.Equals(ArchivePath.FindContentRoot(mapFolder), mapFolder, StringComparison.OrdinalIgnoreCase),
+                    "raiz de contenido: una carpeta con materials/ y models/ deberia ser la raiz");
+                Check(string.Equals(ArchivePath.FindContentRoot(Path.Combine(mapFolder, "materials")), mapFolder, StringComparison.OrdinalIgnoreCase),
+                    "raiz de contenido: agregar materials/ deberia anclar en su carpeta padre");
+                Check(ArchivePath.FindContentRoot(Path.Combine(mapFolder, "materials", "custom")) == null,
+                    "raiz de contenido: una subcarpeta de materials/ no deberia ser raiz");
+            }
+            finally
+            {
+                try { Directory.Delete(temp, true); } catch (IOException) { }
+            }
         }
 
         private static void TestCaseInsensitiveEntries()
@@ -338,7 +406,7 @@ namespace PakRatModern.Tests
             // Referencia generada por la CLI de Python sobre el mismo contenido
             // (tools/make_pak_reference.py). Si deja de coincidir, las dos
             // herramientas divergieron y los mapas dejan de ser reproducibles.
-            var referencePath = FindReferenceFile();
+            var referencePath = FindTestData("reference-pak.sha256");
             if (referencePath == null)
             {
                 Failures.Add("no se encontro reference-pak.sha256; la paridad con la CLI no se verifico");
@@ -350,13 +418,13 @@ namespace PakRatModern.Tests
             Check(hash == expected, $"paridad con la CLI rota: C#={hash} CLI={expected}");
         }
 
-        /// <summary>Sube desde el directorio de salida hasta encontrar testdata/.</summary>
-        private static string FindReferenceFile()
+        /// <summary>Sube desde el directorio de salida hasta encontrar testdata/&lt;ruta&gt;.</summary>
+        internal static string FindTestData(string relativePath)
         {
             var dir = new DirectoryInfo(AppDomain.CurrentDomain.BaseDirectory);
             while (dir != null)
             {
-                var candidate = Path.Combine(dir.FullName, "testdata", "reference-pak.sha256");
+                var candidate = Path.Combine(dir.FullName, "testdata", relativePath);
                 if (File.Exists(candidate)) return candidate;
                 dir = dir.Parent;
             }
@@ -366,14 +434,15 @@ namespace PakRatModern.Tests
         private static Dictionary<string, PakEntry> SampleEntries()
         {
             var entries = PakArchive.NewEntryMap();
-            void Add(string name, string content) =>
-                entries[name] = new PakEntry(name, Encoding.ASCII.GetBytes(content));
+            void Add(string name, string content, bool legacyName = false) =>
+                entries[name] = new PakEntry(name, Encoding.ASCII.GetBytes(content), legacyName);
 
             Add("materials/_pre.vmt", "pre");
             Add("materials/A.vmt", "AAA");
             Add("materials/a_b.vmt", "ab-");
             Add("materials/ab.vmt", "ab");
-            Add("materials/custom/señal.vmt", "utf8");   // cubre el flag UTF-8 del ZIP
+            Add("materials/custom/señal.vmt", "utf8");            // cubre el flag UTF-8 del ZIP
+            Add("materials/legacy/café.vmt", "latin1", true);     // nombre crudo, sin flag, como vbsp
             Add("models/de_dust2/x.mdl", "mdl-data");
             Add("maps/de_dust2.nav", "nav");
             return entries;

@@ -48,6 +48,9 @@ namespace PakRatModern.App
             }
         }
 
+        // Cada arranque agrega dos lineas: sin tope, el log crecia para siempre.
+        private const long MaxLogBytes = 512 * 1024;
+
         private static void Log(string message, Exception ex = null)
         {
             try
@@ -64,7 +67,16 @@ namespace PakRatModern.App
                     ex = ex.InnerException;
                 }
 
-                File.AppendAllLines(AppPaths.LogPath, lines);
+                var path = AppPaths.LogPath;
+                var info = new FileInfo(path);
+                if (info.Exists && info.Length > MaxLogBytes)
+                {
+                    // Se conserva una generacion anterior, como el .bak del BSP.
+                    File.Copy(path, path + ".old", true);
+                    File.Delete(path);
+                }
+
+                File.AppendAllLines(path, lines);
             }
             catch (Exception)
             {

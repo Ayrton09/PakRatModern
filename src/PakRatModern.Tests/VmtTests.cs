@@ -41,6 +41,20 @@ namespace PakRatModern.Tests
             // Un valor sin comillas tambien es sintaxis valida en VMT
             var unquoted = VmtParser.GetDependencies("$basetexture custom/sinComillas").ToList();
             check(unquoted.Contains("materials/custom/sinComillas.vtf"), "vmt: no acepto valores sin comillas");
+
+            // Agua y monitores: render targets del motor, no archivos
+            const string water = @"
+""Water""
+{
+    ""$reflecttexture"" ""_rt_WaterReflection""
+    ""$refracttexture"" ""_rt_WaterRefraction""
+    ""$basetexture""    ""_rt_Camera""
+    ""$normalmap""      ""nature/water_normal""
+}";
+            var waterRefs = VmtParser.GetDependencies(water).ToList();
+            check(!waterRefs.Any(r => r.IndexOf("_rt_", StringComparison.OrdinalIgnoreCase) >= 0),
+                $"vmt: trato un render target como textura -> {string.Join(", ", waterRefs)}");
+            check(waterRefs.Contains("materials/nature/water_normal.vtf"), "vmt: dejo de seguir $normalmap");
         }
     }
 }

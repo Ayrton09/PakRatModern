@@ -31,6 +31,7 @@ namespace PakRatModern.Core
         private const int MaxGameLumps = 1024;
         private const int MaxStaticPropDictEntries = 10000;
         private const int StaticPropNameLength = 128;
+        private const ushort GameLumpCompressed = 0x0001;
 
         public static HashSet<string> Collect(BspFile bsp, string mapName, bool includeExtras)
         {
@@ -48,10 +49,11 @@ namespace PakRatModern.Core
 
         private static void CollectFromEntities(BspFile bsp, ISet<string> set)
         {
-            var entitiesBytes = bsp.GetLumpBytes(PakLimits.EntitiesLumpIndex);
+            var entitiesBytes = bsp.GetLumpData(PakLimits.EntitiesLumpIndex);
             if (entitiesBytes.Length == 0) return;
 
-            var text = Encoding.ASCII.GetString(entitiesBytes).Replace('\0', '\n');
+            // Latin-1 y no ASCII: los bytes altos de un nombre no deben volverse '?'.
+            var text = ZipInspector.Latin1.GetString(entitiesBytes).Replace('\0', '\n');
 
             foreach (Match match in KeyValuePattern.Matches(text))
             {
@@ -74,6 +76,15 @@ namespace PakRatModern.Core
                         AddSkybox(set, value);
                         break;
 
+                    case "texturename":
+                        // env_projectedtexture: una textura, no un material.
+                        GameReference.AddTextureReference(set, value);
+                        break;
+
+                    case "vscripts":
+                        AddVScripts(set, value);
+                        break;
+
                     default:
                         // Una clave que suene a material y un valor con separador
                         // suele ser una ruta aunque no traiga extension.
@@ -93,6 +104,26 @@ namespace PakRatModern.Core
             }
         }
 
+        /// <summary>
+        /// "vscripts" admite varios scripts separados por espacios, relativos a
+        /// scripts/vscripts/ y con .nut implicito (TF2, CS:GO, L4D2, Portal 2).
+        /// </summary>
+        private static void AddVScripts(ISet<string> set, string value)
+        {
+            foreach (var script in value.Split((char[])null, StringSplitOptions.RemoveEmptyEntries))
+            {
+                var name = script.Trim('"').Replace('\\', '/').TrimStart('/');
+                if (name.Length == 0) continue;
+
+                var dot = name.LastIndexOf('.');
+                if (dot < 0 || dot < name.LastIndexOf('/')) name += ".nut";
+
+                if (!name.StartsWith("scripts/vscripts/", StringComparison.OrdinalIgnoreCase))
+                    name = "scripts/vscripts/" + name;
+                GameReference.AddRef(set, name);
+            }
+        }
+
         /// <summary>El skybox son seis caras, cada una con su .vmt y su .vtf.</summary>
         private static void AddSkybox(ISet<string> set, string skyName)
         {
@@ -108,8 +139,8 @@ namespace PakRatModern.Core
 
         private static void CollectFromTexData(BspFile bsp, ISet<string> set)
         {
-            var strData = bsp.GetLumpBytes(PakLimits.TexDataStringDataLumpIndex);
-            var strTable = bsp.GetLumpBytes(PakLimits.TexDataStringTableLumpIndex);
+            var strData = bsp.GetLumpData(PakLimits.TexDataStringDataLumpIndex);
+            var strTable = bsp.GetLumpData(PakLimits.TexDataStringTableLumpIndex);
             if (strData.Length == 0 || strTable.Length == 0) return;
 
             for (var i = 0; i <= strTable.Length - 4; i += 4)
@@ -153,14 +184,26 @@ namespace PakRatModern.Core
                         if (ms.Length - ms.Position < 16) return;
 
                         var id = br.ReadUInt32();
-                        br.ReadUInt16();            // flags
+                        var flags = br.ReadUInt16();
                         br.ReadUInt16();            // version
                         var fileOfs = br.ReadInt32();
                         var fileLen = br.ReadInt32();
 
                         if (id != PakLimits.StaticPropGameLumpId) continue;
-                        if (fileLen < 4 || fileOfs < 0 || (long)fileOfs + fileLen > bsp.Raw.Length) continue;
+                        if (fileOfs < 0 || fileOfs >= bsp.Raw.Length) continue;
 
+                        // En un BSP comprimido cada sub-lump va en LZMA por su
+                        // cuenta (flag 1) y su cabecera dice cuanto ocupa.
+                        if ((flags & GameLumpCompressed) != 0 &&
+                            Lzma.IsSourceCompressed(bsp.Raw, fileOfs, bsp.Raw.Length - fileOfs))
+                        {
+                            var length = (int)Math.Min(Lzma.SourceBlockLength(bsp.Raw, fileOfs), bsp.Raw.Length - fileOfs);
+                            var sprp = Lzma.DecodeSourceBlock(bsp.Raw, fileOfs, length, PakLimits.MaxPakEntryBytes);
+                            ReadStaticPropDictionary(sprp, 0, sprp.Length, set);
+                            continue;
+                        }
+
+                        if (fileLen < 4 || (long)fileOfs + fileLen > bsp.Raw.Length) continue;
                         ReadStaticPropDictionary(bsp.Raw, fileOfs, fileLen, set);
                     }
                 }

@@ -70,6 +70,33 @@ namespace PakRatModern.App
                 DwmSetWindowAttribute(form.Handle, DwmwaUseImmersiveDarkModeBefore20H1, ref enabled, sizeof(int));
         }
 
+        /// <summary>
+        /// Escala la ventana al DPI del sistema. Toda la interfaz se arma con
+        /// coordenadas pensadas para 96 DPI (100 %); sin esto, con 125 % o 150 %
+        /// Windows estiraba la ventana como una imagen y el texto salia borroso.
+        /// Las fuentes estan en puntos y ya crecen solas; aca se escalan
+        /// posiciones, tamanos y anchos de columna. A 100 % no hace nada.
+        /// </summary>
+        public static void ScaleForDpi(Form form)
+        {
+            var factor = form.DeviceDpi / 96f;
+            if (Math.Abs(factor - 1f) < 0.01f) return;
+
+            form.Scale(new SizeF(factor, factor));
+            ScaleListColumns(form, factor);
+        }
+
+        private static void ScaleListColumns(Control control, float factor)
+        {
+            if (control is ListView listView)
+            {
+                foreach (ColumnHeader column in listView.Columns)
+                    column.Width = (int)Math.Round(column.Width * factor);
+            }
+
+            foreach (Control child in control.Controls) ScaleListColumns(child, factor);
+        }
+
         /// <summary>Barras de desplazamiento y bordes oscuros en listas y arboles.</summary>
         public static void ApplyNativeControlTheme(Control control)
         {
@@ -130,11 +157,19 @@ namespace PakRatModern.App
                     button.FlatAppearance.MouseOverBackColor = Header;
                     break;
 
+                case DarkCheckBox darkCheckBox:
+                    // Se dibuja sola con los colores del tema.
+                    darkCheckBox.ForeColor = Text;
+                    break;
+
                 case CheckBox checkBox:
+                    // FlatStyle.Flat pinta la tilde con el color del texto sobre un
+                    // recuadro blanco: con el texto claro del tema no se ve. El
+                    // estilo del sistema al menos muestra el estado real.
                     checkBox.UseVisualStyleBackColor = false;
                     checkBox.BackColor = Color.Transparent;
                     checkBox.ForeColor = Text;
-                    checkBox.FlatStyle = FlatStyle.Flat;
+                    checkBox.FlatStyle = FlatStyle.Standard;
                     break;
 
                 case Label label:

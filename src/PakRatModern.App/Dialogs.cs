@@ -32,6 +32,9 @@ namespace PakRatModern.App
 
         protected override void OnLoad(EventArgs e)
         {
+            // Antes de base.OnLoad: ahi se centra el dialogo, y tiene que ser
+            // con el tamano ya escalado.
+            DarkTheme.ScaleForDpi(this);
             base.OnLoad(e);
             DarkTheme.Apply(this);
         }
@@ -190,9 +193,13 @@ namespace PakRatModern.App
                        $"Not found: {result.Summary.NotFound}     Already in PAK: {result.Summary.AlreadyInPak}",
             };
 
+            // AutoEllipsis: una ruta larga sin espacios cortaba de linea y, con
+            // una sola linea de alto, desaparecia entera. Asi se ve el comienzo y
+            // el tooltip muestra la ruta completa.
             var hint = new Label
             {
-                Left = 10, Top = 30, Width = 900, Height = 18, AutoSize = false,
+                Left = 10, Top = 30, Width = 900, Height = 18, AutoSize = false, AutoEllipsis = true,
+                Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right,
                 ForeColor = DarkTheme.MutedText,
                 Text = $"Game Path: {gameRoot}",
             };
@@ -298,9 +305,14 @@ namespace PakRatModern.App
         private readonly AppSettings _settings;
         private readonly ListBox _roots;
 
+        // "Set as current" se guarda aca y recien pasa a los settings con OK:
+        // modificarlos directo hacia que Cancel no deshiciera la eleccion.
+        private string _current;
+
         public GamePathsForm(AppSettings settings) : base("Manage Game Paths", 560, 300)
         {
             _settings = settings;
+            _current = settings.GameRoot;
 
             var rootsLabel = new Label { Text = "Saved game paths", AutoSize = true, Left = 12, Top = 12 };
 
@@ -350,15 +362,15 @@ namespace PakRatModern.App
 
         private void SetCurrent()
         {
-            if (_roots.SelectedItem is string selected) _settings.GameRoot = selected;
+            if (_roots.SelectedItem is string selected) _current = selected;
         }
 
         private void Commit()
         {
             _settings.SavedGameRoots = _roots.Items.Cast<string>().ToList();
-
-            if (!_settings.SavedGameRoots.Contains(_settings.GameRoot, StringComparer.OrdinalIgnoreCase))
-                _settings.GameRoot = _settings.SavedGameRoots.FirstOrDefault() ?? string.Empty;
+            _settings.GameRoot = _settings.SavedGameRoots.Contains(_current, StringComparer.OrdinalIgnoreCase)
+                ? _current
+                : _settings.SavedGameRoots.FirstOrDefault() ?? string.Empty;
         }
     }
 
@@ -367,8 +379,8 @@ namespace PakRatModern.App
     {
         private readonly AppSettings _settings;
         private readonly TextBox _gameRoot;
-        private readonly CheckBox _includeExtras;
-        private readonly CheckBox _backup;
+        private readonly DarkCheckBox _includeExtras;
+        private readonly DarkCheckBox _backup;
 
         public PreferencesForm(AppSettings settings) : base("Preferences", 700, 196)
         {
@@ -382,19 +394,19 @@ namespace PakRatModern.App
             var browse = new Button { Text = "Browse...", Left = 588, Top = 13, Width = 88, Height = 24 };
             browse.Click += (s, e) => BrowseRoot();
 
-            _includeExtras = new CheckBox
+            _includeExtras = new DarkCheckBox
             {
                 Text = "Include optional extras in scan (nav, overviews, particles manifest, soundscapes, radar files)",
-                Left = 100, Top = 54, Width = 580,
+                Left = 100, Top = 54, Width = 580, Height = 22,
                 Checked = settings.IncludeExtrasInScan,
             };
 
             // El respaldo se hace siempre que se sobrescriba un BSP existente,
             // tambien con Save As sobre otro mapa; el texto lo dice tal cual.
-            _backup = new CheckBox
+            _backup = new DarkCheckBox
             {
                 Text = "Create a .bak copy before overwriting an existing BSP (replaces the previous .bak)",
-                Left = 100, Top = 80, Width = 580,
+                Left = 100, Top = 80, Width = 580, Height = 22,
                 Checked = settings.BackupBeforeInPlaceSave,
             };
 

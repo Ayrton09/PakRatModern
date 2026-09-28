@@ -1,4 +1,6 @@
+using System;
 using System.Collections.Generic;
+using System.Linq;
 using System.Text;
 
 namespace PakRatModern.Core
@@ -26,12 +28,25 @@ namespace PakRatModern.Core
         private const int MaxTextures = 4096;
         private const int MaxCdTextures = 1024;
 
+        /// <summary>Todas las combinaciones directorio + textura, sin agrupar.</summary>
         public static IReadOnlyList<string> GetMaterialRefs(byte[] bytes)
         {
             var refs = new List<string>();
-            if (bytes == null || bytes.Length < MinHeaderSize) return refs;
+            foreach (var candidates in GetMaterialCandidates(bytes)) refs.AddRange(candidates);
+            return refs;
+        }
 
-            if (Encoding.ASCII.GetString(bytes, 0, 4) != "IDST") return refs;
+        /// <summary>
+        /// Por cada textura, sus rutas posibles en el orden en que el motor las
+        /// prueba. El motor se queda con la primera que existe, asi que exigir
+        /// todas reporta como faltantes archivos que nunca iba a buscar.
+        /// </summary>
+        public static IReadOnlyList<IReadOnlyList<string>> GetMaterialCandidates(byte[] bytes)
+        {
+            var groups = new List<IReadOnlyList<string>>();
+            if (bytes == null || bytes.Length < MinHeaderSize) return groups;
+
+            if (Encoding.ASCII.GetString(bytes, 0, 4) != "IDST") return groups;
 
             var numTextures = GameReference.ReadInt32Safe(bytes, NumTexturesOffset);
             var textureIndex = GameReference.ReadInt32Safe(bytes, TextureIndexOffset);
@@ -39,7 +54,7 @@ namespace PakRatModern.Core
             var cdTextureIndex = GameReference.ReadInt32Safe(bytes, CdTextureIndexOffset);
 
             if (numTextures == null || textureIndex == null || numTextures < 0 || numTextures > MaxTextures)
-                return refs;
+                return groups;
 
             if (numCdTextures == null || cdTextureIndex == null || numCdTextures < 0 || numCdTextures > MaxCdTextures)
                 numCdTextures = 0;
@@ -58,7 +73,7 @@ namespace PakRatModern.Core
                 if (!string.IsNullOrWhiteSpace(name)) textureNames.Add(name);
             }
 
-            if (textureNames.Count == 0) return refs;
+            if (textureNames.Count == 0) return groups;
 
             var textureDirs = new List<string>();
             if (numCdTextures > 0 && cdTextureIndex > 0)
@@ -78,15 +93,18 @@ namespace PakRatModern.Core
 
             foreach (var textureName in textureNames)
             {
+                var candidates = new List<string>();
                 foreach (var textureDir in textureDirs)
                 {
                     var materialPath = GameReference.JoinModelMaterialPath(textureDir, textureName);
                     var reference = GameReference.ToMaterialVmt(materialPath);
-                    if (reference != null) refs.Add(reference);
+                    if (reference != null && !candidates.Contains(reference, StringComparer.OrdinalIgnoreCase))
+                        candidates.Add(reference);
                 }
+                if (candidates.Count > 0) groups.Add(candidates);
             }
 
-            return refs;
+            return groups;
         }
     }
 }

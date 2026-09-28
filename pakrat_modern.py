@@ -7,6 +7,7 @@ Features:
 - extract selected/all files
 - add/update files
 - remove files
+- repack the PAK uncompressed
 - verify pak lump integrity
 
 This tool updates only the PAKFILE lump and preserves the original BSP layout,
@@ -20,6 +21,7 @@ import fnmatch
 import io
 import os
 import re
+import stat
 import struct
 import sys
 import tempfile
@@ -27,7 +29,9 @@ import zipfile
 from collections.abc import MutableMapping
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import Iterable, List, Tuple
+from typing import Iterable, List, Optional, Tuple
+
+__version__ = "1.3.2"
 
 LUMP_COUNT = 64
 PAK_LUMP_INDEX = 40
@@ -44,6 +48,13 @@ MAX_PAK_ENTRIES = 20000
 CANONICAL_DATE_TIME = (1980, 1, 1, 0, 0, 0)
 _UNSAFE_ARCHIVE_CHARS = re.compile(r'[\x00-\x1f<>:"|?*]')
 _RESERVED_WINDOWS_NAMES = re.compile(r"^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(\..*)?$", re.IGNORECASE)
+_UTF8_FLAG = 0x800
+
+# Orden de los campos de cada entrada de la tabla de lumps. Left 4 Dead 2 pone
+# la version primero; leida en el orden normal, sus offsets caen dentro de la
+# cabecera.
+LAYOUT_STANDARD = "standard"
+LAYOUT_VERSION_FIRST = "version_first"
 
 
 @dataclass
@@ -60,6 +71,7 @@ class BSPFile:
     version: int
     map_revision: int
     lumps: List[Lump]
+    layout: str = LAYOUT_STANDARD
 
 
 class PakEntries(MutableMapping):
@@ -68,12 +80,15 @@ class PakEntries(MutableMapping):
     El motor Source resuelve rutas sin distinguir mayusculas, asi que
     materials/Custom/a.vmt y materials/custom/a.vmt son la misma entrada para el
     juego: dejar las dos dentro del ZIP hace impredecible cual gana. Se conserva
-    la capitalizacion de la primera insercion, igual que hace el GUI (que usa un
-    [ordered]@{} de PowerShell, tambien insensible a mayusculas).
+    la capitalizacion de la primera insercion, igual que hace el GUI.
     """
 
     def __init__(self) -> None:
         self._items: "dict[str, Tuple[str, bytes]]" = {}
+        # Claves (en minusculas) cuyo nombre llego sin el flag UTF-8, como lo
+        # escriben vbsp y bspzip. Se reescriben con los mismos bytes: el motor
+        # busca los bytes crudos y pasarlos a UTF-8 cambia el archivo que encuentra.
+        self._legacy: "set[str]" = set()
         # Entradas descartadas al leer, como (nombre_original, motivo). Ver
         # read_pak_entries: una entrada con ruta insegura no invalida el resto.
         self.skipped: List[Tuple[str, str]] = []
@@ -93,6 +108,7 @@ class PakEntries(MutableMapping):
 
     def __delitem__(self, key: str) -> None:
         del self._items[key.lower()]
+        self._legacy.discard(key.lower())
 
     def __contains__(self, key: object) -> bool:
         return isinstance(key, str) and key.lower() in self._items
@@ -103,20 +119,29 @@ class PakEntries(MutableMapping):
     def __len__(self) -> int:
         return len(self._items)
 
+    def set_legacy(self, key: str) -> None:
+        """Marca un nombre para escribirlo en Latin-1 y sin flag UTF-8, como vino."""
+        name = self._items[key.lower()][0]
+        if any(ord(c) > 127 for c in name) and all(ord(c) <= 0xFF for c in name):
+            self._legacy.add(key.lower())
+
+    def is_legacy(self, key: str) -> bool:
+        return key.lower() in self._legacy
+
 
 def _norm_archive_path(path: str) -> str:
     p = path.replace("\\", "/").strip()
     if p.startswith("/"):
-        raise ValueError(f"Ruta absoluta invalida dentro del BSP: {path}")
+        raise ValueError(f"Unsafe absolute path inside the BSP: {path}")
     if p in {"", "."}:
-        raise ValueError("Ruta dentro del BSP invalida")
+        raise ValueError("Invalid path inside the BSP")
     if _UNSAFE_ARCHIVE_CHARS.search(p):
-        raise ValueError(f"Caracteres invalidos en ruta dentro del BSP: {path}")
+        raise ValueError(f"Invalid characters in path inside the BSP: {path}")
     for part in p.split("/"):
         if part in {"", ".", ".."} or part.endswith(".") or part.endswith(" "):
-            raise ValueError(f"Ruta invalida dentro del BSP: {path}")
+            raise ValueError(f"Unsafe path inside the BSP: {path}")
         if _RESERVED_WINDOWS_NAMES.match(part):
-            raise ValueError(f"Nombre reservado en ruta dentro del BSP: {path}")
+            raise ValueError(f"Reserved Windows name in path inside the BSP: {path}")
     return str(PurePosixPath(p))
 
 
@@ -124,47 +149,72 @@ def _align4(value: int) -> int:
     return (value + 3) & ~3
 
 
-def parse_bsp(path: Path) -> BSPFile:
-    size = path.stat().st_size
-    if size > MAX_BSP_BYTES:
-        raise ValueError(f"BSP demasiado grande ({size} bytes; limite {MAX_BSP_BYTES})")
-    raw = path.read_bytes()
-    if len(raw) < HEADER_SIZE:
-        raise ValueError("Archivo demasiado pequeno para ser BSP Source")
-
-    ident = raw[0:4]
-    if ident != IDENT:
-        raise ValueError("Identificador BSP invalido (se esperaba VBSP)")
-
-    version = struct.unpack_from("<i", raw, 4)[0]
+def _read_lump_table(raw: bytes, layout: str) -> Tuple[Optional[List[Lump]], Optional[str]]:
+    """Tabla de lumps en ese orden de campos, o (None, error) si no es coherente."""
     lumps: List[Lump] = []
-
     offset = 8
     for i in range(LUMP_COUNT):
-        fileofs, filelen, lump_version, fourcc = struct.unpack_from("<iii4s", raw, offset)
+        first, second, third, fourcc = struct.unpack_from("<iii4s", raw, offset)
         offset += 16
+        if layout == LAYOUT_STANDARD:
+            fileofs, filelen, lump_version = first, second, third
+        else:
+            lump_version, fileofs, filelen = first, second, third
         if filelen < 0:
-            raise ValueError(f"Lump {i} tiene longitud negativa")
+            return None, f"Lump {i} has a negative length"
         if filelen > 0:
             # Un lump que empieza dentro de la cabecera no puede ser valido: al
             # guardar se reescribe la cabecera encima de el.
-            start = fileofs
-            end = start + filelen
-            if start < HEADER_SIZE or end > len(raw):
-                raise ValueError(f"Lump {i} fuera de rango (ofs={start}, len={filelen})")
+            if fileofs < HEADER_SIZE or fileofs + filelen > len(raw):
+                return None, f"Lump {i} out of range (ofs={fileofs}, len={filelen})"
         lumps.append(Lump(fileofs, filelen, lump_version, fourcc))
-
-    map_revision = struct.unpack_from("<i", raw, offset)[0]
-
-    return BSPFile(raw=raw, version=version, map_revision=map_revision, lumps=lumps)
+    return lumps, None
 
 
-def _serialize_header(version: int, map_revision: int, lumps: List[Lump]) -> bytes:
+def parse_bsp(path: Path) -> BSPFile:
+    size = path.stat().st_size
+    if size > MAX_BSP_BYTES:
+        raise ValueError(f"BSP is too large ({size} bytes; limit {MAX_BSP_BYTES})")
+    return parse_bsp_bytes(path.read_bytes())
+
+
+def parse_bsp_bytes(raw: bytes) -> BSPFile:
+    if len(raw) < HEADER_SIZE:
+        raise ValueError("File is too small for a Source BSP")
+
+    ident = raw[0:4]
+    if ident != IDENT:
+        raise ValueError("Invalid BSP identifier (expected VBSP)")
+
+    version = struct.unpack_from("<i", raw, 4)[0]
+    lumps, error = _read_lump_table(raw, LAYOUT_STANDARD)
+    layout = LAYOUT_STANDARD
+    if lumps is None:
+        # Una tabla danada leida en el otro orden casi siempre parece "todo
+        # vacio" (el campo de version suele ser 0). Una de L4D2 de verdad
+        # conserva todos sus lumps: tantos no vacios como offsets no nulos.
+        alternative, _ = _read_lump_table(raw, LAYOUT_VERSION_FIRST)
+        if alternative is not None:
+            non_empty = sum(1 for lump in alternative if lump.filelen > 0)
+            positive = sum(1 for i in range(LUMP_COUNT) if struct.unpack_from("<i", raw, 8 + i * 16 + 4)[0] > 0)
+            if non_empty > 0 and non_empty >= positive:
+                lumps, layout = alternative, LAYOUT_VERSION_FIRST
+    if lumps is None:
+        raise ValueError(error)
+
+    map_revision = struct.unpack_from("<i", raw, 8 + LUMP_COUNT * 16)[0]
+    return BSPFile(raw=raw, version=version, map_revision=map_revision, lumps=lumps, layout=layout)
+
+
+def _serialize_header(version: int, map_revision: int, lumps: List[Lump], layout: str = LAYOUT_STANDARD) -> bytes:
     header = io.BytesIO()
     header.write(IDENT)
     header.write(struct.pack("<i", version))
     for lump in lumps:
-        header.write(struct.pack("<iii4s", lump.fileofs, lump.filelen, lump.version, lump.fourcc))
+        if layout == LAYOUT_VERSION_FIRST:
+            header.write(struct.pack("<iii4s", lump.version, lump.fileofs, lump.filelen, lump.fourcc))
+        else:
+            header.write(struct.pack("<iii4s", lump.fileofs, lump.filelen, lump.version, lump.fourcc))
     header.write(struct.pack("<i", map_revision))
     return header.getvalue()
 
@@ -187,14 +237,14 @@ _READABLE_METHODS = (zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED, zipfile.ZIP_BZIP2
 def _check_limits(entry_count: int, sizes: Iterable[Tuple[str, int]]) -> None:
     """Limites compartidos por lectura, escritura y verify, con el mismo texto."""
     if entry_count > MAX_PAK_ENTRIES:
-        raise ValueError(f"PAK tiene demasiadas entradas ({entry_count}; limite {MAX_PAK_ENTRIES})")
+        raise ValueError(f"PAK has too many entries ({entry_count}; limit {MAX_PAK_ENTRIES})")
     total = 0
     for name, size in sizes:
         if size > MAX_PAK_ENTRY_BYTES:
-            raise ValueError(f"Entrada PAK demasiado grande: {name} ({size} bytes)")
+            raise ValueError(f"PAK entry is too large: {name} ({size} bytes)")
         total += size
         if total > MAX_PAK_TOTAL_BYTES:
-            raise ValueError(f"PAK demasiado grande descomprimido (limite {MAX_PAK_TOTAL_BYTES} bytes)")
+            raise ValueError(f"PAK is too large uncompressed (limit {MAX_PAK_TOTAL_BYTES} bytes)")
 
 
 def _check_supported(infos: List[zipfile.ZipInfo]) -> None:
@@ -206,10 +256,23 @@ def _check_supported(infos: List[zipfile.ZipInfo]) -> None:
         if info.compress_type not in _READABLE_METHODS:
             bad[info.compress_type] = bad.get(info.compress_type, 0) + 1
     if bad:
-        detail = ", ".join(f"{n} x {_METHOD_NAMES.get(m, f'metodo {m}')}" for m, n in bad.items())
+        detail = ", ".join(f"{n} x {_METHOD_NAMES.get(m, f'method {m}')}" for m, n in bad.items())
         raise UnsupportedCompression(
-            f"El PAK usa un metodo de compresion que no se puede leer ({detail}, de {len(infos)} entradas)."
+            f"The PAK uses a compression method that cannot be read ({detail}, out of {len(infos)} entries)."
         )
+
+
+def _entry_name(info: zipfile.ZipInfo) -> str:
+    """Nombre de la entrada con los mismos caracteres que ve el GUI.
+
+    Sin el flag UTF-8, zipfile decodifica como CP437; se vuelve a los bytes y
+    se lee como Latin-1, que los conserva uno a uno. Se parte de orig_filename,
+    que no esta cortado en el primer byte nulo: asi un nombre con '\\0' se
+    rechaza igual que en el GUI en lugar de aceptarse truncado.
+    """
+    if info.flag_bits & _UTF8_FLAG:
+        return info.orig_filename
+    return info.orig_filename.encode("cp437").decode("latin-1")
 
 
 def read_pak_entries(pak_bytes: bytes) -> PakEntries:
@@ -222,15 +285,16 @@ def read_pak_entries(pak_bytes: bytes) -> PakEntries:
         _check_supported(infos)
         _check_limits(len(infos), ((info.filename, info.file_size) for info in infos))
         for info in infos:
+            raw_name = _entry_name(info)
 
             # Hay mapas publicados con rutas absolutas dentro del PAK
             # ("C:/Program Files/.../x.vmt", "/sound/y.mp3"). Se descartan esas
             # entradas, no el mapa entero: rechazar todo dejaba inaccesibles
             # cientos de archivos validos por una sola entrada mal empaquetada.
             try:
-                name = _norm_archive_path(info.filename)
+                name = _norm_archive_path(raw_name)
             except ValueError as exc:
-                entries.skipped.append((info.filename, str(exc)))
+                entries.skipped.append((raw_name, str(exc)))
                 continue
 
             # Por ZipInfo y no por nombre: con nombres repetidos, zf.read(nombre)
@@ -238,11 +302,24 @@ def read_pak_entries(pak_bytes: bytes) -> PakEntries:
             data = zf.read(info)
             if name in entries:
                 if entries[name] == data:
-                    entries.duplicates.append(info.filename)
+                    entries.duplicates.append(raw_name)
                 else:
-                    entries.duplicates.append(f"{info.filename} (contenido distinto; se conserva la ultima copia)")
+                    entries.duplicates.append(f"{raw_name} (different content; last copy kept)")
+                entries[name] = data
+                continue
             entries[name] = data
+            if not info.flag_bits & _UTF8_FLAG:
+                entries.set_legacy(name)
     return entries
+
+
+class _RawNameZipInfo(zipfile.ZipInfo):
+    """Entrada cuyo nombre se escribe con sus bytes originales (Latin-1) y sin flag UTF-8."""
+
+    __slots__ = ()
+
+    def _encodeFilenameFlags(self):  # noqa: N802 (nombre de zipfile)
+        return self.filename.encode("latin-1"), self.flag_bits & ~_UTF8_FLAG
 
 
 def write_pak_entries(entries: PakEntries) -> bytes:
@@ -253,7 +330,8 @@ def write_pak_entries(entries: PakEntries) -> bytes:
         # en C#. sorted() ordena por code point y difiere fuera del BMP.
         for name in sorted(entries, key=lambda n: n.encode("utf-16-be")):
             data = entries[name]
-            new_info = zipfile.ZipInfo(filename=name, date_time=CANONICAL_DATE_TIME)
+            info_class = _RawNameZipInfo if entries.is_legacy(name) else zipfile.ZipInfo
+            new_info = info_class(filename=name, date_time=CANONICAL_DATE_TIME)
             # Forma canonica fija, sin copiar nada del PAK de origen: antes se
             # arrastraban comment, internal_attr, create_system y external_attr,
             # asi que el resultado dependia de con que herramienta se habia
@@ -278,9 +356,9 @@ def _safe_extract_target(out_dir: Path, arcname: str) -> Path:
     target = (out_dir / Path(arcname)).resolve()
     root = out_dir.resolve()
     if target == root:
-        raise ValueError(f"Ruta de extraccion invalida: {arcname}")
+        raise ValueError(f"Invalid extraction path: {arcname}")
     if os.path.commonpath([str(root), str(target)]) != str(root):
-        raise ValueError(f"Ruta de extraccion insegura: {arcname}")
+        raise ValueError(f"Unsafe extraction path: {arcname}")
     return target
 
 
@@ -293,7 +371,7 @@ def list_pak(bsp: BSPFile) -> List[Tuple[str, int]]:
 def extract_pak(
     bsp: BSPFile,
     out_dir: Path,
-    patterns: Iterable[str] | None = None,
+    patterns: Optional[Iterable[str]] = None,
     overwrite: bool = False,
 ) -> Tuple[int, int]:
     """Devuelve (extraidos, saltados). Sin overwrite, un archivo que ya existe
@@ -332,17 +410,17 @@ def update_pak_add(
 
     for file_path in files:
         if not file_path.is_file():
-            raise ValueError(f"No existe archivo: {file_path}")
+            raise ValueError(f"File not found: {file_path}")
 
         try:
             rel = file_path.relative_to(base)
         except ValueError as exc:
-            raise ValueError(f"{file_path} no esta dentro de --base {base}") from exc
+            raise ValueError(f"{file_path} is not inside --base {base}") from exc
 
         arcname = _norm_archive_path(str(rel))
         size = file_path.stat().st_size
         if size > MAX_PAK_ENTRY_BYTES:
-            raise ValueError(f"Archivo demasiado grande para PAK: {file_path} ({size} bytes)")
+            raise ValueError(f"File is too large for the PAK: {file_path} ({size} bytes)")
         data = file_path.read_bytes()
 
         if arcname in entries:
@@ -370,35 +448,44 @@ def update_pak_remove(bsp: BSPFile, names: Iterable[str]) -> Tuple[int, bytes]:
     return removed, new_pak
 
 
+def repack_pak(bsp: BSPFile) -> Tuple[int, bytes]:
+    """Reescribe el PAK sin compresion y sin agregar ni quitar nada. Es lo que
+    necesita un mapa con entradas BZip2 para abrirse en el GUI."""
+    entries = read_pak_entries(_get_lump_bytes(bsp, PAK_LUMP_INDEX))
+    _warn_skipped(entries)
+    return len(entries), write_pak_entries(entries)
+
+
 def _warn_skipped(entries: PakEntries) -> None:
     """Avisa por stderr de lo que se descarto o unifico al leer el PAK."""
     if entries.skipped:
         print(
-            f"Aviso: {len(entries.skipped)} entrada(s) del PAK se ignoraron por tener rutas inseguras.",
+            f"Warning: {len(entries.skipped)} PAK entr{'y was' if len(entries.skipped) == 1 else 'ies were'} "
+            "skipped because of unsafe paths.",
             file=sys.stderr,
         )
         for name, reason in entries.skipped[:10]:
             print(f"  - {name}  ({reason})", file=sys.stderr)
         if len(entries.skipped) > 10:
-            print(f"  ... y {len(entries.skipped) - 10} mas", file=sys.stderr)
-        print("  Guardar el BSP las quitara del mapa.", file=sys.stderr)
+            print(f"  ... and {len(entries.skipped) - 10} more", file=sys.stderr)
+        print("  Saving the BSP will remove them from the map.", file=sys.stderr)
 
     if entries.duplicates:
         print(
-            f"Aviso: {len(entries.duplicates)} entrada(s) repetidas se unificaron "
-            "(el motor no distingue mayusculas y solo puede cargar una).",
+            f"Warning: {len(entries.duplicates)} duplicate entr{'y was' if len(entries.duplicates) == 1 else 'ies were'} "
+            "merged (the engine ignores case and can only load one).",
             file=sys.stderr,
         )
         for name in entries.duplicates[:10]:
             print(f"  - {name}", file=sys.stderr)
         if len(entries.duplicates) > 10:
-            print(f"  ... y {len(entries.duplicates) - 10} mas", file=sys.stderr)
+            print(f"  ... and {len(entries.duplicates) - 10} more", file=sys.stderr)
 
 
 def verify_pak(bsp: BSPFile) -> Tuple[bool, str]:
     pak_bytes = _get_lump_bytes(bsp, PAK_LUMP_INDEX)
     if not pak_bytes:
-        return True, "PAK lump vacio (sin recursos embebidos)."
+        return True, "PAK lump is empty (no embedded files)."
 
     # Mismo criterio que el GUI: leer con las reglas de rutas, reescribir y
     # volver a leer. Asi "valido" significa "lo que se guardaria se puede
@@ -409,23 +496,23 @@ def verify_pak(bsp: BSPFile) -> Tuple[bool, str]:
             _check_supported([info for info in zf.infolist() if not info.is_dir()])
             bad = zf.testzip()
             if bad:
-                return False, f"ZIP corrupto; primer archivo con error: {bad}"
+                return False, f"Damaged ZIP; first file with an error: {bad}"
         entries = read_pak_entries(pak_bytes)
         back = read_pak_entries(write_pak_entries(entries))
     except zipfile.BadZipFile as exc:
-        return False, f"PAK lump no es ZIP valido: {exc}"
+        return False, f"PAK lump is not a valid ZIP: {exc}"
     except (NotImplementedError, UnsupportedCompression) as exc:
-        return False, f"PAK con compresion no soportada: {exc}"
+        return False, f"PAK uses unsupported compression: {exc}"
     except ValueError as exc:
         return False, str(exc)
 
     notes = []
     if entries.skipped:
-        notes.append(f"{len(entries.skipped)} entrada(s) con ruta insegura se descartarian al guardar")
+        notes.append(f"{len(entries.skipped)} entr{'y' if len(entries.skipped) == 1 else 'ies'} with unsafe paths would be dropped on save")
     if entries.duplicates:
-        notes.append(f"{len(entries.duplicates)} entrada(s) repetida(s) se unificarian")
+        notes.append(f"{len(entries.duplicates)} duplicate entr{'y' if len(entries.duplicates) == 1 else 'ies'} would be merged")
     suffix = f" ({'; '.join(notes)})" if notes else ""
-    return True, f"ZIP valido con {len(back)} entradas{suffix}"
+    return True, f"ZIP valid with {len(back)} entries{suffix}"
 
 
 def apply_pak_to_bsp(bsp: BSPFile, new_pak: bytes) -> bytes:
@@ -454,8 +541,8 @@ def apply_pak_to_bsp(bsp: BSPFile, new_pak: bytes) -> bytes:
 
         if delta != 0 and game.filelen > 0 and game.fileofs > old_start:
             raise ValueError(
-                "No se puede redimensionar el PAKFILE porque LUMP_GAME_LUMP esta despues en el archivo; "
-                "eso puede corromper offsets internos. Prueba con un BSP donde PAK sea el ultimo lump."
+                "Cannot resize the PAKFILE because LUMP_GAME_LUMP comes after it in the file; "
+                "its internal offsets are absolute and would break."
             )
 
         updated_raw = raw[:old_start] + new_pak + (b"\x00" * padding) + raw[old_end:]
@@ -472,20 +559,30 @@ def apply_pak_to_bsp(bsp: BSPFile, new_pak: bytes) -> bytes:
         pak.filelen = len(new_pak)
 
     if len(updated_raw) > MAX_BSP_BYTES:
-        raise ValueError(f"BSP resultante demasiado grande ({len(updated_raw)} bytes; limite {MAX_BSP_BYTES})")
+        raise ValueError(f"Resulting BSP is too large ({len(updated_raw)} bytes; limit {MAX_BSP_BYTES})")
 
-    header = _serialize_header(bsp.version, bsp.map_revision, lumps)
+    header = _serialize_header(bsp.version, bsp.map_revision, lumps, bsp.layout)
     return header + updated_raw[HEADER_SIZE:]
 
 
-def _write_bytes_atomic(target: Path, data: bytes) -> None:
+def _default_mode() -> int:
+    """Permisos de un archivo nuevo segun el umask, como haria open()."""
+    umask = os.umask(0)
+    os.umask(umask)
+    return 0o666 & ~umask
+
+
+def _write_bytes_atomic(target: Path, data: bytes, mode: Optional[int] = None) -> None:
     """Escribe primero a un temporal del mismo directorio y luego reemplaza.
 
     Un corte a mitad de escritura no puede dejar el BSP destino truncado: o se
     ve el contenido viejo o el nuevo, nunca uno a medias. Es el mismo esquema
-    que usa el GUI (Write-FileBytesResponsive).
+    que usa el GUI (AtomicFile).
     """
     target = Path(target)
+    if mode is None and os.name == "posix":
+        mode = stat.S_IMODE(target.stat().st_mode) if target.exists() else _default_mode()
+
     # Nombre unico y creacion exclusiva (O_EXCL): un temporal predecible se
     # podia truncar o redirigir con un enlace colocado de antemano.
     fd, tmp_name = tempfile.mkstemp(prefix=f"{target.name}.", suffix=".tmp", dir=str(target.parent))
@@ -495,6 +592,10 @@ def _write_bytes_atomic(target: Path, data: bytes) -> None:
             handle.write(data)
             handle.flush()
             os.fsync(handle.fileno())
+        if os.name == "posix":
+            # mkstemp crea el temporal con 0600: sin esto, cada BSP reescrito
+            # quedaba ilegible para otros usuarios (FastDL, srcds con otra cuenta).
+            os.chmod(tmp_path, mode)
         os.replace(tmp_path, target)
     except BaseException:
         try:
@@ -509,15 +610,17 @@ def _write_output(target: Path, data: bytes, backup: bool) -> None:
     original (--inplace) o cualquier --out que ya exista; es lo que hace el
     GUI. El .bak se reemplaza en cada guardado: es un deshacer de un paso."""
     if backup and target.exists():
-        backup_path = target.with_suffix(target.suffix + ".bak")
-        _write_bytes_atomic(backup_path, target.read_bytes())
+        backup_path = target.with_name(target.name + ".bak")
+        mode = stat.S_IMODE(target.stat().st_mode) if os.name == "posix" else None
+        _write_bytes_atomic(backup_path, target.read_bytes(), mode)
     _write_bytes_atomic(target, data)
 
 
 def _resolve_output(args, default_suffix: str) -> Path:
     if args.inplace:
         return args.bsp
-    return args.out or args.bsp.with_stem(args.bsp.stem + default_suffix)
+    # with_name y no with_stem: with_stem no existe en Python 3.8.
+    return args.out or args.bsp.with_name(args.bsp.stem + default_suffix + args.bsp.suffix)
 
 
 def _iter_files_from_args(values: List[str]) -> List[Path]:
@@ -532,50 +635,55 @@ def _iter_files_from_args(values: List[str]) -> List[Path]:
                 if sub.is_file():
                     result.append(sub)
             continue
-        raise ValueError(f"Ruta no encontrada: {value}")
+        raise ValueError(f"Path not found: {value}")
     return sorted(set(result))
 
 
-def main(argv: List[str] | None = None) -> int:
+def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(
         prog="pakrat_modern",
-        description="Gestion de recursos embebidos en BSP (lump PAKFILE).",
+        description="Manage the files embedded in a Source BSP (PAKFILE lump).",
     )
+    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
-    p_list = sub.add_parser("list", help="Listar archivos embebidos")
+    p_list = sub.add_parser("list", help="List embedded files")
     p_list.add_argument("bsp", type=Path)
 
-    p_extract = sub.add_parser("extract", help="Extraer archivos embebidos")
+    p_extract = sub.add_parser("extract", help="Extract embedded files")
     p_extract.add_argument("bsp", type=Path)
     p_extract.add_argument("--out", type=Path, default=Path("extracted_pak"))
-    p_extract.add_argument("--overwrite", action="store_true", help="Pisar archivos que ya existan en --out")
-    p_extract.add_argument("patterns", nargs="*", help="Globs opcionales (sin distinguir mayusculas)")
+    p_extract.add_argument("--overwrite", action="store_true", help="Replace files that already exist in --out")
+    p_extract.add_argument("patterns", nargs="*", help="Optional globs (case-insensitive)")
 
     def add_output_options(p: argparse.ArgumentParser) -> None:
         dest = p.add_mutually_exclusive_group()
-        dest.add_argument("--inplace", action="store_true", help="Sobrescribir el BSP original")
-        dest.add_argument("--out", type=Path, help="Ruta de salida")
-        p.add_argument("--no-backup", action="store_true", help="No crear .bak al pisar un archivo existente")
+        dest.add_argument("--inplace", action="store_true", help="Overwrite the original BSP")
+        dest.add_argument("--out", type=Path, help="Output path")
+        p.add_argument("--no-backup", action="store_true", help="Do not create a .bak when overwriting an existing file")
 
-    p_add = sub.add_parser("add", help="Agregar o reemplazar archivos en PAK")
+    p_add = sub.add_parser("add", help="Add or replace files in the PAK")
     p_add.add_argument("bsp", type=Path)
-    p_add.add_argument("paths", nargs="+", help="Archivos o directorios a agregar")
-    p_add.add_argument("--base", type=Path, required=True, help="Raiz para rutas internas")
+    p_add.add_argument("paths", nargs="+", help="Files or folders to add")
+    p_add.add_argument("--base", type=Path, required=True, help="Folder that internal paths are relative to")
     add_output_options(p_add)
 
-    p_remove = sub.add_parser("remove", help="Quitar archivos por ruta interna")
+    p_remove = sub.add_parser("remove", help="Remove files by internal path")
     p_remove.add_argument("bsp", type=Path)
     p_remove.add_argument("names", nargs="+")
     add_output_options(p_remove)
 
-    p_verify = sub.add_parser("verify", help="Verificar integridad del PAK")
+    p_repack = sub.add_parser("repack", help="Rewrite the PAK uncompressed without adding or removing files")
+    p_repack.add_argument("bsp", type=Path)
+    add_output_options(p_repack)
+
+    p_verify = sub.add_parser("verify", help="Check that the PAK can be read and rewritten")
     p_verify.add_argument("bsp", type=Path)
 
     args = parser.parse_args(argv)
 
     if args.cmd == "add" and not args.base.is_dir():
-        parser.error(f"--base no es un directorio: {args.base}")
+        parser.error(f"--base is not a folder: {args.base}")
 
     try:
         bsp = parse_bsp(args.bsp)
@@ -583,21 +691,21 @@ def main(argv: List[str] | None = None) -> int:
         if args.cmd == "list":
             items = list_pak(bsp)
             if not items:
-                print("Sin archivos embebidos")
+                print("No embedded files")
                 return 0
             total = 0
             for name, size in items:
                 total += size
                 print(f"{size:10d}  {name}")
-            print(f"\nTotal: {len(items)} archivos, {total} bytes")
+            print(f"\nTotal: {len(items)} files, {total} bytes")
             return 0
 
         if args.cmd == "extract":
             args.out.mkdir(parents=True, exist_ok=True)
             count, skipped = extract_pak(bsp, args.out, args.patterns, overwrite=args.overwrite)
-            print(f"Extraidos {count} archivo(s) a: {args.out}")
+            print(f"Extracted {count} file(s) to: {args.out}")
             if skipped:
-                print(f"{skipped} archivo(s) ya existian y se conservaron (usa --overwrite para pisarlos)")
+                print(f"{skipped} file(s) already existed and were kept (use --overwrite to replace them)")
             return 0
 
         if args.cmd == "verify":
@@ -612,10 +720,7 @@ def main(argv: List[str] | None = None) -> int:
 
             target = _resolve_output(args, "_packed")
             _write_output(target, new_bytes, backup=not args.no_backup)
-            print(
-                f"PAK actualizado: +{added} nuevo(s), {replaced} reemplazado(s). "
-                f"Salida: {target}"
-            )
+            print(f"PAK updated: {added} added, {replaced} replaced. Output: {target}")
             return 0
 
         if args.cmd == "remove":
@@ -624,10 +729,19 @@ def main(argv: List[str] | None = None) -> int:
 
             target = _resolve_output(args, "_stripped")
             _write_output(target, new_bytes, backup=not args.no_backup)
-            print(f"PAK actualizado: {removed} eliminado(s). Salida: {target}")
+            print(f"PAK updated: {removed} removed. Output: {target}")
             return 0
 
-        raise AssertionError(f"comando sin manejar: {args.cmd}")
+        if args.cmd == "repack":
+            count, new_pak = repack_pak(bsp)
+            new_bytes = apply_pak_to_bsp(bsp, new_pak)
+
+            target = _resolve_output(args, "_repacked")
+            _write_output(target, new_bytes, backup=not args.no_backup)
+            print(f"PAK rewritten uncompressed: {count} file(s). Output: {target}")
+            return 0
+
+        raise AssertionError(f"unhandled command: {args.cmd}")
 
     except UnsupportedCompression as exc:
         print(f"Error: {exc}", file=sys.stderr)
